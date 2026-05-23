@@ -405,6 +405,50 @@ function runBridgeRefreshHandler(key, done) {
   if (typeof done === 'function') done();
 }
 
+function isBridgeAIPage() {
+  return SITE === 'chatgpt' || SITE === 'claude' || SITE === 'gemini';
+}
+
+function syncBridgeTargetPickerVisibility() {
+  var isAIPage = isBridgeAIPage();
+  var currentTitle = document.title || SITE_NAME || '현재 AI 탭';
+
+  var aiSourceSelect = document.getElementById('ctb-ai-source-select');
+  var aiCurrentTabLabel = document.getElementById('ctb-ai-current-tab-label');
+
+  var tgAiSelect = document.getElementById('ctb-ai-select');
+  var tgCurrentTabLabel = document.getElementById('ctb-tg-current-tab-label');
+
+  if (isAIPage) {
+    if (aiSourceSelect) aiSourceSelect.style.display = 'none';
+    if (aiCurrentTabLabel) {
+      aiCurrentTabLabel.style.display = 'block';
+      aiCurrentTabLabel.textContent = currentTitle;
+      aiCurrentTabLabel.title = currentTitle;
+    }
+    if (tgAiSelect) tgAiSelect.style.display = 'none';
+    if (tgCurrentTabLabel) {
+      tgCurrentTabLabel.style.display = 'block';
+      tgCurrentTabLabel.textContent = currentTitle;
+      tgCurrentTabLabel.title = currentTitle;
+    }
+    return;
+  }
+
+  if (aiSourceSelect) aiSourceSelect.style.display = '';
+  if (aiCurrentTabLabel) {
+    aiCurrentTabLabel.style.display = 'none';
+    aiCurrentTabLabel.textContent = '';
+    aiCurrentTabLabel.title = '';
+  }
+  if (tgAiSelect) tgAiSelect.style.display = '';
+  if (tgCurrentTabLabel) {
+    tgCurrentTabLabel.style.display = 'none';
+    tgCurrentTabLabel.textContent = '';
+    tgCurrentTabLabel.title = '';
+  }
+}
+
 
 // ────────────────────────────────────────
 // AI 위젯 (AI→TG 전용)
@@ -498,7 +542,10 @@ function injectAIWidget() {
   panel.querySelector('#ctb-ai-minimize').addEventListener('click', (e) => { e.stopPropagation(); minimize(); });
     panel.querySelector('#ctb-ai-refresh').addEventListener('click', (e) => {
     e.stopPropagation();
-    runBridgeRefreshHandler('aiSource', function() { setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok'); });
+    runBridgeRefreshHandler('aiSource', function() {
+      syncBridgeTargetPickerVisibility();
+      setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok');
+    });
   });
   panel.addEventListener('click', () => { if (isMinimized) restore(); });
   panel.querySelector('#ctb-ai-close').addEventListener('click', (e) => { e.stopPropagation(); panel.style.display = 'none'; });
@@ -547,7 +594,37 @@ function injectAIWidget() {
     btn1.style.background = tabInfo && AI_SOURCE_COLORS[tabInfo.site] ? AI_SOURCE_COLORS[tabInfo.site] : '#2AABEE';
     btn1.title = tabInfo ? siteName + ' - ' + tabInfo.title : '';
   };
-  
+
+  function getSelectedAISourceTabId() {
+    if (aiSourceSelect && aiSourceSelect.value) {
+      return Number(aiSourceSelect.value);
+    }
+    return aiSourceTarget ? aiSourceTarget.id : null;
+  }
+
+  function updateAISourcePanelUI() {
+    if (isCurrentPageAI) {
+      if (aiSourceSelect) {
+        aiSourceSelect.style.display = 'none';
+      }
+      if (aiCurrentTabLabel) {
+        var currentTitle = document.title || SITE_NAME || '현재 AI 탭';
+        aiCurrentTabLabel.style.display = 'block';
+        aiCurrentTabLabel.textContent = currentTitle;
+        aiCurrentTabLabel.title = currentTitle;
+      }
+      return;
+    }
+    if (aiSourceSelect) {
+      aiSourceSelect.style.display = '';
+    }
+    if (aiCurrentTabLabel) {
+      aiCurrentTabLabel.style.display = 'none';
+      aiCurrentTabLabel.textContent = '';
+      aiCurrentTabLabel.title = '';
+    }
+  }
+
   const refreshAiSourceTabs = function(done) {
     try {
       chrome.runtime.sendMessage({ action: 'getAiTabs' }, function(res) {
@@ -601,9 +678,21 @@ function injectAIWidget() {
   refreshAiSourceTabs();
   registerBridgeRefreshHandler('aiSource', refreshAiSourceTabs);
   aiSourceSelect.addEventListener('change', function() {
-    var sel = this.options[this.selectedIndex];
-    if (sel && sel.value) applyAISource({ site: sel.dataset.site, siteName: sel.dataset.siteName, title: sel.textContent, id: Number(sel.value) });
-    else applyAISource(null);
+    const selected = this.options[this.selectedIndex];
+
+    if (selected && selected.value) {
+      applyAISource({
+        site: selected.dataset.site,
+        siteName: selected.dataset.siteName,
+        title: selected.title || selected.textContent,
+        id: Number(selected.value)
+      });
+    } else {
+      applyAISource(null);
+    }
+
+    _prevStreaming = null;
+    checkStreaming();
   });
   chrome.storage.local.get(['bridge_autosend_ai'], (res) => {
     if (res?.bridge_autosend_ai !== undefined) autoCheck.checked = res.bridge_autosend_ai;
@@ -673,10 +762,13 @@ function injectAIWidget() {
     if (_streamingCheckBusy) return;
     _streamingCheckBusy = true;
 
+    var selectedAiTabId = getSelectedAISourceTabId();
+    console.log('[AI-STREAM-REMOTE] selectedAiTabId=', selectedAiTabId, 'aiSourceTarget=', aiSourceTarget ? aiSourceTarget.id : null);
     chrome.runtime.sendMessage({
       action: 'checkAiTabStreaming',
-      targetTabId: aiSourceTarget ? aiSourceTarget.id : null
+      targetTabId: selectedAiTabId
     }, function(res) {
+      console.log('[AI-STREAM-REMOTE-RES]', res);
       _streamingCheckBusy = false;
 
       if (chrome.runtime.lastError || !res || !res.ok) {
@@ -690,6 +782,8 @@ function injectAIWidget() {
 
   checkStreaming();
   setInterval(checkStreaming, 1500);
+
+  syncBridgeTargetPickerVisibility();
 }
 
 // ────────────────────────────────────────
@@ -783,7 +877,10 @@ function injectTGWidget() {
   panel.querySelector('#ctb-tg-minimize').addEventListener('click', (e) => { e.stopPropagation(); minimize(); });
   panel.querySelector('#ctb-tg-refresh').addEventListener('click', (e) => {
     e.stopPropagation();
-    runBridgeRefreshHandler('tgTarget', function() { setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok'); });
+    runBridgeRefreshHandler('tgTarget', function() {
+      syncBridgeTargetPickerVisibility();
+      setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok');
+    });
   });
   panel.addEventListener('click', () => { if (isMinimized) restore(); });
   panel.querySelector('#ctb-tg-close').addEventListener('click', (e) => { e.stopPropagation(); panel.style.display = 'none'; });
@@ -865,6 +962,8 @@ function injectTGWidget() {
   };
 
   refreshAiTabs();
+  registerBridgeRefreshHandler('tgTarget', refreshAiTabs);
+
   aiSelect.addEventListener('change', function() {
     var sel = this.options[this.selectedIndex];
     if (sel && sel.value) {
@@ -942,6 +1041,8 @@ function injectTGWidget() {
     e.stopPropagation();
     toggleOtherWidget();
   });
+
+  syncBridgeTargetPickerVisibility();
 }
 
 // ────────────────────────────────────────
@@ -1025,11 +1126,21 @@ function applyState(state) {
   var ai = document.getElementById('ctb-ai-panel');
   var tg = document.getElementById('ctb-tg-panel');
   if (!ai || !tg) return;
+
   var isTG = location.hostname.indexOf('web.telegram.org') >= 0;
   var showAI = (state === 'swapped') ? isTG : !isTG;
+
   console.log('[APPLYSTATE] state=', state, ' isTG=', isTG, ' showAI=', showAI);
-  if (showAI) { ai.style.display = ''; tg.style.display = 'none'; }
-  else { tg.style.display = ''; ai.style.display = 'none'; }
+
+  if (showAI) {
+    ai.style.display = '';
+    tg.style.display = 'none';
+  } else {
+    tg.style.display = '';
+    ai.style.display = 'none';
+  }
+
+  syncBridgeTargetPickerVisibility();
 }
 
 // ── 위젯 스위치 ──
