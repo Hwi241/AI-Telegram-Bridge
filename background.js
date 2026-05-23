@@ -103,8 +103,60 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.tabs.query({ url: ['https://chatgpt.com/*','https://chat.openai.com/*','https://claude.ai/*','https://gemini.google.com/*'] }, (tabs) => {
       var mapped = tabs.map(function(t){ return { id: t.id, title: t.title, url: t.url }; });
       mapped.sort(function(a,b){ if (a.id === sId) return -1; if (b.id === sId) return 1; return 0; });
-      sendResponse({ tabs: mapped });
+      sendResponse({ tabs: mapped, senderTabId: sId });
     });
+    return true;
+  }
+
+  if (msg.action === 'checkAiTabStreaming') {
+    (async () => {
+      let aiTab = null;
+
+      if (msg.targetTabId) {
+        try {
+          const target = await chrome.tabs.get(msg.targetTabId);
+          if (target && isAiUrl(target.url)) {
+            aiTab = target;
+          }
+        } catch (e) {
+          aiTab = null;
+        }
+      }
+
+      if (!aiTab && sender.tab?.id) {
+        try {
+          const senderTab = await chrome.tabs.get(sender.tab.id);
+          if (senderTab && isAiUrl(senderTab.url)) {
+            aiTab = senderTab;
+          }
+        } catch (e) {
+          aiTab = null;
+        }
+      }
+
+      if (!aiTab) {
+        aiTab = await findFirstAiTab();
+      }
+
+      if (!aiTab) {
+        sendResponse({
+          ok: false,
+          streaming: false,
+          error: 'AI 탭을 찾을 수 없습니다.'
+        });
+        return;
+      }
+
+      const streamRes = await sendToTab(aiTab.id, { action: 'checkStreaming' }).catch(() => null);
+
+      sendResponse({
+        ok: true,
+        streaming: !!streamRes?.streaming,
+        tabId: aiTab.id,
+        title: aiTab.title || ''
+      });
+    })();
+
     return true;
   }
 
