@@ -389,6 +389,22 @@ function setPanelBtnsDisabled(btns, v) {
   btns.forEach(b => { if (b) b.disabled = v; });
 }
 
+function getBridgeRefreshHandlers() {
+  window.__ctbRefreshHandlers = window.__ctbRefreshHandlers || {};
+  return window.__ctbRefreshHandlers;
+}
+
+function registerBridgeRefreshHandler(key, handler) {
+  if (!key || typeof handler !== 'function') return;
+  getBridgeRefreshHandlers()[key] = handler;
+}
+
+function runBridgeRefreshHandler(key, done) {
+  var handler = getBridgeRefreshHandlers()[key];
+  if (typeof handler === 'function') { handler(done); return; }
+  if (typeof done === 'function') done();
+}
+
 
 // ────────────────────────────────────────
 // AI 위젯 (AI→TG 전용)
@@ -417,6 +433,8 @@ function injectAIWidget() {
     </div>
     <div id="ctb-body">
       <button id="ctb-ai-btn1" class="ctb-btn ctb-tg">📤 → Telegram</button>
+      <select id="ctb-ai-source-select" style="width:100%;margin-bottom:5px;padding:2px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;"><option value="">AI 탭 목록 받는 중...</option></select>
+      <div id="ctb-ai-current-tab-label" style="display:none;width:100%;margin-bottom:5px;padding:3px 4px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></div>
       <div id="ctb-mode-row">
         <button id="ctb-ai-mode-full" class="ctb-mode-btn">전체</button>
         <button id="ctb-ai-mode-code" class="ctb-mode-btn ctb-mode-active">코드</button>
@@ -480,19 +498,7 @@ function injectAIWidget() {
   panel.querySelector('#ctb-ai-minimize').addEventListener('click', (e) => { e.stopPropagation(); minimize(); });
     panel.querySelector('#ctb-ai-refresh').addEventListener('click', (e) => {
     e.stopPropagation();
-    var savedLeft = panel.style.left;
-    var savedTop = panel.style.top;
-    if (panel.parentNode) panel.parentNode.removeChild(panel);
-    injectAIWidget();
-    setTimeout(function() {
-      var newPanel = document.getElementById('ctb-ai-panel');
-      if (newPanel && (savedLeft || savedTop)) {
-        newPanel.style.right = 'auto'; newPanel.style.bottom = 'auto';
-        if (savedLeft) newPanel.style.left = savedLeft;
-        if (savedTop) newPanel.style.top = savedTop;
-        chrome.storage.local.set({ widgetPos_ai: { left: parseInt(savedLeft)||0, top: parseInt(savedTop)||0 }});
-      }
-    }, 100);
+    runBridgeRefreshHandler('aiSource', function() { setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok'); });
   });
   panel.addEventListener('click', () => { if (isMinimized) restore(); });
   panel.querySelector('#ctb-ai-close').addEventListener('click', (e) => { e.stopPropagation(); panel.style.display = 'none'; });
@@ -529,6 +535,76 @@ function injectAIWidget() {
   const statusEl = panel.querySelector('#ctb-status');
   const btn1 = panel.querySelector('#ctb-ai-btn1');
   const autoCheck = panel.querySelector('#ctb-ai-autosend');
+  const AI_SOURCE_COLORS = { chatgpt: '#10A37F', claude: '#D97757', gemini: '#EA4335' };
+  let aiSourceTarget = null;
+  const aiSourceSelect = panel.querySelector('#ctb-ai-source-select');
+  const aiCurrentTabLabel = panel.querySelector('#ctb-ai-current-tab-label');
+  const isCurrentPageAI = SITE === 'chatgpt' || SITE === 'claude' || SITE === 'gemini';
+  const applyAISource = function(tabInfo) {
+    aiSourceTarget = tabInfo;
+    var siteName = tabInfo ? (tabInfo.siteName || 'AI') : 'AI';
+    btn1.textContent = '\u{1F4E4} \u2192 Telegram';
+    btn1.style.background = tabInfo && AI_SOURCE_COLORS[tabInfo.site] ? AI_SOURCE_COLORS[tabInfo.site] : '#2AABEE';
+    btn1.title = tabInfo ? siteName + ' - ' + tabInfo.title : '';
+  };
+  
+  const refreshAiSourceTabs = function(done) {
+    try {
+      chrome.runtime.sendMessage({ action: 'getAiTabs' }, function(res) {
+        if (!res || !res.tabs || !res.tabs.length) {
+          aiSourceSelect.innerHTML = '<option value="">AI 탭 없음</option>';
+          applyAISource(null);
+          updateAISourcePanelUI();
+          if (typeof done === 'function') done();
+          return;
+        }
+        var tabs = res.tabs;
+        var previousTargetId = aiSourceTarget ? Number(aiSourceTarget.id) : null;
+        var senderTabId = res.senderTabId ? Number(res.senderTabId) : null;
+        aiSourceSelect.innerHTML = '';
+        tabs.forEach(function(t) {
+          var site = 'ai', siteName = 'AI';
+          if (t.url.indexOf('chatgpt.com') >= 0 || t.url.indexOf('chat.openai.com') >= 0) { site = 'chatgpt'; siteName = 'ChatGPT'; }
+          else if (t.url.indexOf('claude.ai') >= 0) { site = 'claude'; siteName = 'Claude'; }
+          else if (t.url.indexOf('gemini.google.com') >= 0) { site = 'gemini'; siteName = 'Gemini'; }
+          var o = document.createElement('option');
+          o.value = String(t.id); o.textContent = t.title || siteName;
+          o.title = t.title || siteName;
+          o.dataset.site = site; o.dataset.siteName = siteName;
+          aiSourceSelect.appendChild(o);
+        });
+        var selectedTabId = null;
+        if (isCurrentPageAI && senderTabId && tabs.some(function(tx) { return Number(tx.id) === senderTabId; })) {
+          selectedTabId = senderTabId;
+        } else if (previousTargetId && tabs.some(function(tx) { return Number(tx.id) === previousTargetId; })) {
+          selectedTabId = previousTargetId;
+        } else {
+          selectedTabId = Number(tabs[0].id);
+        }
+        aiSourceSelect.value = String(selectedTabId);
+        var selectedOption = Array.from(aiSourceSelect.options).find(function(x) { return Number(x.value) === selectedTabId; });
+        var selectedTab = tabs.find(function(x) { return Number(x.id) === selectedTabId; });
+        if (selectedOption && selectedTab) {
+          applyAISource({ site: selectedOption.dataset.site, siteName: selectedOption.dataset.siteName, title: selectedTab.title || selectedOption.textContent, id: selectedTab.id });
+        }
+        updateAISourcePanelUI();
+        if (typeof done === 'function') done();
+      });
+    } catch(e) {
+      aiSourceSelect.innerHTML = '<option value="">AI 탭 오류</option>';
+      applyAISource(null);
+      updateAISourcePanelUI();
+      if (typeof done === 'function') done();
+    }
+  };
+
+  refreshAiSourceTabs();
+  registerBridgeRefreshHandler('aiSource', refreshAiSourceTabs);
+  aiSourceSelect.addEventListener('change', function() {
+    var sel = this.options[this.selectedIndex];
+    if (sel && sel.value) applyAISource({ site: sel.dataset.site, siteName: sel.dataset.siteName, title: sel.textContent, id: Number(sel.value) });
+    else applyAISource(null);
+  });
   chrome.storage.local.get(['bridge_autosend_ai'], (res) => {
     if (res?.bridge_autosend_ai !== undefined) autoCheck.checked = res.bridge_autosend_ai;
   });
@@ -543,7 +619,7 @@ function injectAIWidget() {
     const autoSend = autoCheck.checked;
     setBtnsDisabled(true);
     setStatus('⏳ 처리 중...');
-    chrome.runtime.sendMessage({ action: 'aiToTelegram', autoSend }, (res) => {
+    chrome.runtime.sendMessage({ action: 'aiToTelegram', autoSend, targetTabId: isCurrentPageAI ? null : (aiSourceTarget ? aiSourceTarget.id : null) }, (res) => {
       setBtnsDisabled(false);
       if (chrome.runtime.lastError) { setStatus(`❌ ${chrome.runtime.lastError.message}`, 'err'); return; }
       if (res?.ok) setStatus('✅ Telegram 전송!', 'ok');
@@ -560,23 +636,58 @@ function injectAIWidget() {
   // ── AI 작성 중 감지 ──
   var _streaming = false;
   var _prevStreaming = null;
-  function checkStreaming() {
-    var s = false;
-    try { s = isStreaming(); } catch(e) {}
-    if (s !== _prevStreaming) {
-      _prevStreaming = s;
-      _streaming = s;
-      if (s) {
-        setStatus('\u23F3 \uC791\uC131 \uC911...');
-        panel.style.background = '#ffffff';
-        panel.style.borderColor = '#d0d0d0';
-      } else {
-        setStatus('\u2705 \uC644\uB8CC');
-        panel.style.background = '#1a1a2e';
-        panel.style.borderColor = '#3a3a5c';
-      }
+  var _streamingCheckBusy = false;
+
+  function applyStreamingPanelState(streaming) {
+    _streaming = streaming;
+
+    if (streaming) {
+      setStatus('\u23F3 \uC791\uC131 \uC911...');
+      panel.style.background = '#ffffff';
+      panel.style.borderColor = '#d0d0d0';
+    } else {
+      setStatus('\u2705 \uC644\uB8CC');
+      panel.style.background = '#1a1a2e';
+      panel.style.borderColor = '#3a3a5c';
     }
   }
+
+  function updateStreamingState(streaming) {
+    if (streaming === _prevStreaming) return;
+    _prevStreaming = streaming;
+    applyStreamingPanelState(streaming);
+  }
+
+  function checkStreaming() {
+    if (isCurrentPageAI) {
+      var localStreaming = false;
+      try {
+        localStreaming = isStreaming();
+      } catch (e) {
+        localStreaming = false;
+      }
+      updateStreamingState(localStreaming);
+      return;
+    }
+
+    if (_streamingCheckBusy) return;
+    _streamingCheckBusy = true;
+
+    chrome.runtime.sendMessage({
+      action: 'checkAiTabStreaming',
+      targetTabId: aiSourceTarget ? aiSourceTarget.id : null
+    }, function(res) {
+      _streamingCheckBusy = false;
+
+      if (chrome.runtime.lastError || !res || !res.ok) {
+        updateStreamingState(false);
+        return;
+      }
+
+      updateStreamingState(!!res.streaming);
+    });
+  }
+
   checkStreaming();
   setInterval(checkStreaming, 1500);
 }
@@ -612,7 +723,8 @@ function injectTGWidget() {
         <button id="ctb-tgmode-all" class="ctb-mode-btn ctb-mode-active">답변전체</button>
         <button id="ctb-tgmode-last" class="ctb-mode-btn">마지막1개</button>
       </div>
-      <select id="ctb-ai-select" style="width:100%;margin-bottom:5px;padding:2px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;"><option value="">탭 목록 받는 중...</option></select><label id="ctb-tg-autosend-label" style="display:flex !important;align-items:center;gap:4px;margin-top:2px;cursor:pointer">
+      <select id="ctb-ai-select" style="width:100%;margin-bottom:5px;padding:2px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;"><option value="">탭 목록 받는 중...</option></select>
+      <div id="ctb-tg-current-tab-label" style="display:none;width:100%;margin-bottom:5px;padding:3px 4px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></div><label id="ctb-tg-autosend-label" style="display:flex !important;align-items:center;gap:4px;margin-top:2px;cursor:pointer">
         <input type="checkbox" id="ctb-tg-autosend" checked style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
         <span>전송까지 자동으로</span>
       </label>
@@ -669,7 +781,10 @@ function injectTGWidget() {
   }
 
   panel.querySelector('#ctb-tg-minimize').addEventListener('click', (e) => { e.stopPropagation(); minimize(); });
-  panel.querySelector('#ctb-tg-refresh').addEventListener('click', (e) => { e.stopPropagation(); refreshAiTabs(); });
+  panel.querySelector('#ctb-tg-refresh').addEventListener('click', (e) => {
+    e.stopPropagation();
+    runBridgeRefreshHandler('tgTarget', function() { setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok'); });
+  });
   panel.addEventListener('click', () => { if (isMinimized) restore(); });
   panel.querySelector('#ctb-tg-close').addEventListener('click', (e) => { e.stopPropagation(); panel.style.display = 'none'; });
 
@@ -677,7 +792,9 @@ function injectTGWidget() {
   const SITE_COLORS = { chatgpt: '#10A37F', claude: '#D97757', gemini: '#EA4335' };
   let aiTarget = null;
   const aiSelect = panel.querySelector('#ctb-ai-select');
+  const tgCurrentTabLabel = panel.querySelector('#ctb-tg-current-tab-label');
   const tgBtn2 = panel.querySelector('#ctb-tg-btn2');
+  const isCurrentPageAIForTG = SITE === 'chatgpt' || SITE === 'claude' || SITE === 'gemini';
   var applyAI = function(tabInfo) {
     aiTarget = tabInfo;
     var siteName = tabInfo ? (tabInfo.siteName || 'AI') : 'AI';
@@ -685,33 +802,74 @@ function injectTGWidget() {
     tgBtn2.style.background = tabInfo && SITE_COLORS[tabInfo.site] ? SITE_COLORS[tabInfo.site] : '#a78bfa';
     tgBtn2.title = tabInfo ? tabInfo.title : '';
   };
+  var updateTGTargetPanelUI = function() {
+    if (isCurrentPageAIForTG) {
+      if (aiSelect) aiSelect.style.display = 'none';
+      if (tgCurrentTabLabel) {
+        var currentTitle = document.title || SITE_NAME || '현재 AI 탭';
+        tgCurrentTabLabel.style.display = 'block';
+        tgCurrentTabLabel.textContent = currentTitle;
+        tgCurrentTabLabel.title = currentTitle;
+      }
+    } else {
+      if (aiSelect) aiSelect.style.display = '';
+      if (tgCurrentTabLabel) { tgCurrentTabLabel.style.display = 'none'; tgCurrentTabLabel.textContent = ''; tgCurrentTabLabel.title = ''; }
+    }
+  };
+
   var refreshAiTabs = function() {
     try {
       chrome.runtime.sendMessage({ action: 'getAiTabs' }, function(res) {
         if (!res || !res.tabs || !res.tabs.length) {
           aiSelect.innerHTML = '<option value="">AI 탭 없음</option>';
-          applyAI(null); return;
+          applyAI(null);
+          updateTGTargetPanelUI();
+          return;
         }
-        var tabs = res.tabs; aiSelect.innerHTML = '';
+        var tabs = res.tabs;
+        var previousTargetId = aiTarget ? Number(aiTarget.id) : null;
+        var senderTabId = res.senderTabId ? Number(res.senderTabId) : null;
+        aiSelect.innerHTML = '';
         tabs.forEach(function(t) {
           var site = 'ai', siteName = 'AI';
           if (t.url.indexOf('chatgpt.com') >= 0 || t.url.indexOf('chat.openai.com') >= 0) { site = 'chatgpt'; siteName = 'ChatGPT'; }
           else if (t.url.indexOf('claude.ai') >= 0) { site = 'claude'; siteName = 'Claude'; }
           else if (t.url.indexOf('gemini.google.com') >= 0) { site = 'gemini'; siteName = 'Gemini'; }
           var o = document.createElement('option');
-          o.value = String(t.id); o.textContent = siteName + ' - ' + (t.title || 'No title');
-          o.dataset.site = site; o.dataset.siteName = siteName; aiSelect.appendChild(o);
+          o.value = String(t.id); o.textContent = t.title || siteName;
+          o.title = t.title || siteName;
+          o.dataset.site = site; o.dataset.siteName = siteName;
+          aiSelect.appendChild(o);
         });
-        aiSelect.value = String(tabs[0].id);
-        var first = aiSelect.options[0];
-        applyAI({ site: first.dataset.site, siteName: first.dataset.siteName, title: tabs[0].title, id: tabs[0].id });
+        var selectedTabId = null;
+        if (isCurrentPageAIForTG && senderTabId && tabs.some(function(tx) { return Number(tx.id) === senderTabId; })) {
+          selectedTabId = senderTabId;
+        } else if (previousTargetId && tabs.some(function(tx) { return Number(tx.id) === previousTargetId; })) {
+          selectedTabId = previousTargetId;
+        } else {
+          selectedTabId = Number(tabs[0].id);
+        }
+        aiSelect.value = String(selectedTabId);
+        var selectedOption = Array.from(aiSelect.options).find(function(x) { return Number(x.value) === selectedTabId; });
+        var selectedTab = tabs.find(function(x) { return Number(x.id) === selectedTabId; });
+        if (selectedOption && selectedTab) {
+          applyAI({ site: selectedOption.dataset.site, siteName: selectedOption.dataset.siteName, title: selectedTab.title || selectedOption.textContent, id: selectedTab.id });
+        }
+        updateTGTargetPanelUI();
       });
-    } catch(e) { aiSelect.innerHTML = '<option value="">AI 탭 오류</option>'; }
+    } catch(e) {
+      aiSelect.innerHTML = '<option value="">AI 탭 오류</option>';
+      applyAI(null);
+      updateTGTargetPanelUI();
+    }
   };
+
   refreshAiTabs();
   aiSelect.addEventListener('change', function() {
     var sel = this.options[this.selectedIndex];
-    if (sel && sel.value) applyAI({ site: sel.dataset.site, siteName: sel.dataset.siteName, title: sel.textContent, id: Number(sel.value) });
+    if (sel && sel.value) {
+      applyAI({ site: sel.dataset.site, siteName: sel.dataset.siteName, title: sel.title || sel.textContent, id: Number(sel.value) });
+    }
   });
 
 
@@ -771,7 +929,7 @@ function injectTGWidget() {
     const autoSend = autoCheck.checked;
     setBtnsDisabled(true);
     setStatus('⏳ 처리 중...');
-    chrome.runtime.sendMessage({ action: 'telegramToAI', autoSend, tgCopyMode, aiTarget, targetTabId: aiTarget ? aiTarget.id : null }, (res) => {
+    chrome.runtime.sendMessage({ action: 'telegramToAI', autoSend, tgCopyMode, aiTarget, targetTabId: isCurrentPageAIForTG ? null : (aiTarget ? aiTarget.id : null) }, (res) => {
       setBtnsDisabled(false);
       if (chrome.runtime.lastError) { setStatus(`❌ ${chrome.runtime.lastError.message}`, 'err'); return; }
       if (res?.ok) setStatus(autoSend ? '✅ AI 전송!' : '✅ AI 입력!', 'ok');
@@ -856,19 +1014,8 @@ chrome.storage.onChanged.addListener((changes) => {
         (b.id === 'ctb-tgmode-last' && tgCopyMode === 'last'));
     });
   }
-  if (changes?.widget_default && !window.__tgLock) {
-    var def2 = changes.widget_default.newValue;
-    var ai2 = document.getElementById('ctb-ai-panel');
-    var tg2 = document.getElementById('ctb-tg-panel');
-    if (ai2 && tg2) {
-      var remoteIsTG = typeof SITE !== 'undefined' && SITE === 'telegram';
-      var toggleToTg = def2 === 'tg';
-      var showTg = remoteIsTG ? !toggleToTg : toggleToTg;
-      console.log('[SYNC-INVERT] def=', def2, 'remoteIsTG=', remoteIsTG, 'showTg=', showTg);
-      if (showTg) { tg2.style.display = ''; ai2.style.display = 'none'; }
-      else { ai2.style.display = ''; tg2.style.display = 'none'; }
-      console.log('[SYNC-INVERT] after, aiAfter=', ai2.style.display, 'tgAfter=', tg2.style.display);
-    }
+  if (changes?.widget_state) {
+    applyState(changes.widget_state.newValue || 'normal');
   }
   console.log('[ONCHANGED] full keys=', JSON.stringify(Object.keys(changes||{})));
 });
@@ -891,10 +1038,10 @@ function toggleOtherWidget() {
   const aiPanel = document.getElementById('ctb-ai-panel');
   const tgPanel = document.getElementById('ctb-tg-panel');
   if (!aiPanel || !tgPanel) return;
-  // widget_state 만 반전, 실제 표시는 applyState에서 함
   chrome.storage.local.get(['widget_state'], function(res) {
     var current = res && res.widget_state === 'swapped' ? 'swapped' : 'normal';
     var next = current === 'normal' ? 'swapped' : 'normal';
+    applyState(next);
     chrome.storage.local.set({ widget_state: next });
   });
 }
