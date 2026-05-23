@@ -794,20 +794,36 @@ function injectAIWidget() {
 
     var selectedAiTabId = getSelectedAISourceTabId();
     console.log('[AI-STREAM-REMOTE] selectedAiTabId=', selectedAiTabId, 'aiSourceTarget=', aiSourceTarget ? aiSourceTarget.id : null);
-    chrome.runtime.sendMessage({
-      action: 'checkAiTabStreaming',
-      targetTabId: selectedAiTabId
-    }, function(res) {
-      console.log('[AI-STREAM-REMOTE-RES]', res);
+
+    try {
+      chrome.runtime.sendMessage({
+        action: 'checkAiTabStreaming',
+        targetTabId: selectedAiTabId
+      }, function(res) {
+        var runtimeError = chrome.runtime.lastError;
+
+        _streamingCheckBusy = false;
+
+        if (runtimeError) {
+          console.log('[AI-STREAM-REMOTE-ERR]', runtimeError.message);
+          updateStreamingState(false);
+          return;
+        }
+
+        console.log('[AI-STREAM-REMOTE-RES]', res);
+
+        if (!res || !res.ok) {
+          updateStreamingState(false);
+          return;
+        }
+
+        updateStreamingState(!!res.streaming);
+      });
+    } catch (e) {
+      console.log('[AI-STREAM-REMOTE-THROW]', e && e.message ? e.message : e);
       _streamingCheckBusy = false;
-
-      if (chrome.runtime.lastError || !res || !res.ok) {
-        updateStreamingState(false);
-        return;
-      }
-
-      updateStreamingState(!!res.streaming);
-    });
+      updateStreamingState(false);
+    }
   }
 
   checkStreaming();
