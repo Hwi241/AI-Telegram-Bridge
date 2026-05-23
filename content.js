@@ -381,6 +381,36 @@ function makeDraggable(panel, handleSelector, storageKey) {
   });
 }
 
+function copyPanelPosition(fromPanel, toPanel, storageKey) {
+  if (!fromPanel || !toPanel || fromPanel === toPanel) return;
+
+  const rect = fromPanel.getBoundingClientRect();
+
+  let left = parseInt(fromPanel.style.left, 10);
+  let top = parseInt(fromPanel.style.top, 10);
+
+  if (!Number.isFinite(left)) {
+    left = Math.round(rect.left);
+  }
+
+  if (!Number.isFinite(top)) {
+    top = Math.round(rect.top);
+  }
+
+  if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+
+  toPanel.style.right = 'auto';
+  toPanel.style.bottom = 'auto';
+  toPanel.style.left = left + 'px';
+  toPanel.style.top = top + 'px';
+
+  if (storageKey) {
+    chrome.storage.local.set({
+      [storageKey]: { left: left, top: top }
+    });
+  }
+}
+
 function setPanelStatus(statusEl, msg, type = '') {
   statusEl.textContent = msg;
   statusEl.className = type;
@@ -1116,13 +1146,13 @@ chrome.storage.onChanged.addListener((changes) => {
     });
   }
   if (changes?.widget_state) {
-    applyState(changes.widget_state.newValue || 'normal');
+    applyState(changes.widget_state.newValue || 'normal', true);
   }
   console.log('[ONCHANGED] full keys=', JSON.stringify(Object.keys(changes||{})));
 });
 
 // ── 위젯 상태 적용 ──
-function applyState(state) {
+function applyState(state, keepPosition) {
   var ai = document.getElementById('ctb-ai-panel');
   var tg = document.getElementById('ctb-tg-panel');
   if (!ai || !tg) return;
@@ -1130,7 +1160,21 @@ function applyState(state) {
   var isTG = location.hostname.indexOf('web.telegram.org') >= 0;
   var showAI = (state === 'swapped') ? isTG : !isTG;
 
-  console.log('[APPLYSTATE] state=', state, ' isTG=', isTG, ' showAI=', showAI);
+  var currentPanel = null;
+  if (getComputedStyle(ai).display !== 'none') {
+    currentPanel = ai;
+  } else if (getComputedStyle(tg).display !== 'none') {
+    currentPanel = tg;
+  }
+
+  var nextPanel = showAI ? ai : tg;
+  var nextStorageKey = showAI ? 'widgetPos_ai' : 'widgetPos_tg';
+
+  console.log('[APPLYSTATE] state=', state, ' isTG=', isTG, ' showAI=', showAI, 'keepPosition=', !!keepPosition);
+
+  if (keepPosition && currentPanel && currentPanel !== nextPanel) {
+    copyPanelPosition(currentPanel, nextPanel, nextStorageKey);
+  }
 
   if (showAI) {
     ai.style.display = '';
@@ -1152,7 +1196,7 @@ function toggleOtherWidget() {
   chrome.storage.local.get(['widget_state'], function(res) {
     var current = res && res.widget_state === 'swapped' ? 'swapped' : 'normal';
     var next = current === 'normal' ? 'swapped' : 'normal';
-    applyState(next);
+    applyState(next, true);
     chrome.storage.local.set({ widget_state: next });
   });
 }
