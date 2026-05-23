@@ -1,0 +1,506 @@
+// content.js v3.0
+// Claude, ChatGPT, Gemini, Telegram 범용 지원
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ── 현재 사이트 감지 ──
+const SITE = (() => {
+  const h = location.hostname;
+  if (h === 'claude.ai') return 'claude';
+  if (h === 'chat.openai.com' || h === 'chatgpt.com') return 'chatgpt';
+  if (h === 'gemini.google.com') return 'gemini';
+  if (h.includes('web.telegram.org')) return 'telegram';
+  return null;
+})();
+
+const SITE_NAME = { claude: 'Claude', chatgpt: 'ChatGPT', gemini: 'Gemini', telegram: 'Telegram' }[SITE] || 'AI';
+
+// ── 복사 모드: 'full' | 'code' ──
+let copyMode = 'code'; // 기본값: 코드블록
+
+// ── 공통 입력 함수 ──
+function setInput(el, text) {
+  el.focus();
+  if (el.isContentEditable) {
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, text);
+    if (!el.textContent.trim() || el.textContent.trim() !== text.trim()) {
+      el.textContent = text;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: text, inputType: 'insertText' }));
+    }
+  } else {
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+    if (nativeSetter) nativeSetter.call(el, text);
+    else el.value = text;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+
+// ── 토큰 추정 ──
+function estimateTokens(text) {
+  if (!text) return 0;
+  const korean = (text.match(/[가-힣]/g) || []).length;
+  const others = text.length - korean;
+  return Math.ceil(korean / 2 + others / 4);
+}
+
+// ────────────────────────────────────────
+// Claude
+// ────────────────────────────────────────
+function claude_getResponse() {
+  const selectors = ['.font-claude-message', '[data-testid="assistant-message"]', '.prose', '.standard-markdown'];
+  for (const sel of selectors) {
+    const els = document.querySelectorAll(sel);
+    if (!els.length) continue;
+    const last = els[els.length - 1];
+    const code = last.querySelectorAll('pre');
+    if (copyMode === 'code' && code.length) return code[code.length - 1].innerText?.trim() || null;
+    return last.innerText?.trim() || null;
+  }
+  return null;
+}
+
+function claude_isStreaming() {
+  const stops = [
+    'button[aria-label="Stop generating"]', 'button[aria-label="Stop response"]',
+    'button[aria-label="응답 중지"]', 'button[data-testid="stop-button"]', 'button[aria-label="Stop"]'
+  ];
+  return stops.some(s => document.querySelector(s));
+}
+
+async function claude_pasteInput(text, autoSend) {
+  const input = document.querySelector('[data-testid="chat-input"]');
+  if (!input) return { ok: false, error: '입력창을 찾을 수 없어요.' };
+  setInput(input, text);
+  if (!autoSend) return { ok: true };
+  await sleep(400);
+  const btn = document.querySelector('button[aria-label="메시지 보내기"], button[aria-label="Send message"]');
+  if (!btn || btn.disabled) return { ok: false, error: '전송 버튼을 찾을 수 없어요.' };
+  btn.click();
+  return { ok: true };
+}
+
+function claude_getInputEl() {
+  return document.querySelector('[data-testid="chat-input"]');
+}
+
+// ────────────────────────────────────────
+// ChatGPT
+// ────────────────────────────────────────
+function chatgpt_getResponse() {
+  const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+  if (!msgs.length) return null;
+  const last = msgs[msgs.length - 1];
+  const code = last.querySelectorAll('pre');
+  if (copyMode === 'code' && code.length) return code[code.length - 1].innerText?.trim() || null;
+  return last.innerText?.trim() || null;
+}
+
+function chatgpt_isStreaming() {
+  return !!document.querySelector(
+    'button[aria-label="Stop streaming"], [data-testid="stop-button"], button[aria-label="Stop generating"]'
+  );
+}
+
+async function chatgpt_pasteInput(text, autoSend) {
+  const input = document.querySelector('#prompt-textarea') ||
+                document.querySelector('div[contenteditable="true"][data-lexical-editor]') ||
+                document.querySelector('div[contenteditable="true"]');
+  if (!input) return { ok: false, error: '입력창을 찾을 수 없어요.' };
+  setInput(input, text);
+  if (!autoSend) return { ok: true };
+  await sleep(400);
+  const btn = document.querySelector(
+    'button[data-testid="send-button"], button[aria-label="Send message"], button[aria-label="메시지 보내기"]'
+  );
+  if (!btn || btn.disabled) return { ok: false, error: '전송 버튼을 찾을 수 없어요.' };
+  btn.click();
+  return { ok: true };
+}
+
+function chatgpt_getInputEl() {
+  return document.querySelector('#prompt-textarea') ||
+         document.querySelector('div[contenteditable="true"]');
+}
+
+// ────────────────────────────────────────
+// Gemini
+// ────────────────────────────────────────
+function gemini_getResponse() {
+  const selectors = [
+    'model-response .response-content',
+    '.model-response-text',
+    'message-content',
+    '.response-container-scrollable'
+  ];
+  for (const sel of selectors) {
+    const els = document.querySelectorAll(sel);
+    if (!els.length) continue;
+    const last = els[els.length - 1];
+    const code = last.querySelectorAll('pre');
+    if (copyMode === 'code' && code.length) return code[code.length - 1].innerText?.trim() || null;
+    return last.innerText?.trim() || null;
+  }
+  return null;
+}
+
+function gemini_isStreaming() {
+  return !!document.querySelector('.loading-indicator, [aria-label="Stop generating"], .progress-container');
+}
+
+async function gemini_pasteInput(text, autoSend) {
+  const input = document.querySelector('rich-textarea div[contenteditable="true"]') ||
+                document.querySelector('.ql-editor') ||
+                document.querySelector('div[contenteditable="true"]');
+  if (!input) return { ok: false, error: '입력창을 찾을 수 없어요.' };
+  setInput(input, text);
+  if (!autoSend) return { ok: true };
+  await sleep(400);
+  const btn = document.querySelector('button[aria-label="Send message"], button.send-button');
+  if (!btn || btn.disabled) return { ok: false, error: '전송 버튼을 찾을 수 없어요.' };
+  btn.click();
+  return { ok: true };
+}
+
+function gemini_getInputEl() {
+  return document.querySelector('rich-textarea div[contenteditable="true"]') ||
+         document.querySelector('div[contenteditable="true"]');
+}
+
+// ────────────────────────────────────────
+// Telegram
+// ────────────────────────────────────────
+function telegram_getLastMessage() {
+  const allMsgs = document.querySelectorAll('.Message');
+  const botMsgs = Array.from(allMsgs).filter(m => !m.classList.contains('own'));
+  if (!botMsgs.length) return null;
+  const last = botMsgs[botMsgs.length - 1];
+  return last.querySelector('.text-content')?.innerText?.trim() || null;
+}
+
+async function telegram_sendMessage(text, autoSend) {
+  const input = document.querySelector('#editable-message-text');
+  if (!input) return { ok: false, error: 'Telegram 입력창을 찾을 수 없어요.' };
+  input.focus();
+  document.execCommand('selectAll', false, null);
+  document.execCommand('insertText', false, text);
+  input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+  if (!autoSend) return { ok: true };
+  await sleep(400);
+  const btn = document.querySelector('button.main-button');
+  if (!btn || btn.disabled) return { ok: false, error: '전송 버튼을 찾을 수 없어요.' };
+  btn.click();
+  return { ok: true };
+}
+
+// ────────────────────────────────────────
+// 사이트별 디스패처
+// ────────────────────────────────────────
+function getResponse() {
+  if (SITE === 'claude')  return claude_getResponse();
+  if (SITE === 'chatgpt') return chatgpt_getResponse();
+  if (SITE === 'gemini')  return gemini_getResponse();
+  return null;
+}
+
+function isStreaming() {
+  if (SITE === 'claude')  return claude_isStreaming();
+  if (SITE === 'chatgpt') return chatgpt_isStreaming();
+  if (SITE === 'gemini')  return gemini_isStreaming();
+  return false;
+}
+
+async function pasteToAI(text, autoSend) {
+  if (SITE === 'claude')  return claude_pasteInput(text, autoSend);
+  if (SITE === 'chatgpt') return chatgpt_pasteInput(text, autoSend);
+  if (SITE === 'gemini')  return gemini_pasteInput(text, autoSend);
+  return { ok: false, error: '지원하지 않는 사이트예요.' };
+}
+
+function getInputEl() {
+  if (SITE === 'claude')  return claude_getInputEl();
+  if (SITE === 'chatgpt') return chatgpt_getInputEl();
+  if (SITE === 'gemini')  return gemini_getInputEl();
+  return null;
+}
+
+// ────────────────────────────────────────
+// 플로팅 패널 UI
+// ────────────────────────────────────────
+function injectFloatingUI() {
+  if (document.getElementById('ctb-panel')) return;
+
+  const panel = document.createElement('div');
+  panel.id = 'ctb-panel';
+  panel.innerHTML = `
+    <div id="ctb-title">
+      <span id="ctb-title-text">🔗 ${SITE_NAME}</span>
+      <div id="ctb-controls">
+        <button id="ctb-refresh"  title="새로고침">↺</button>
+        <button id="ctb-minimize" title="최소화">−</button>
+        <button id="ctb-close"    title="닫기">✕</button>
+      </div>
+    </div>
+    <div id="ctb-body">
+      <button id="ctb-btn1" class="ctb-btn ctb-tg">📤 → Telegram</button>
+      <button id="ctb-btn2" class="ctb-btn ctb-cl">📥 → ${SITE_NAME}</button>
+      <label id="ctb-autosend-label">
+        <input type="checkbox" id="ctb-autosend" checked />
+        <span>전송까지 자동으로</span>
+      </label>
+      <div id="ctb-mode-row">
+        <button id="ctb-mode-full" class="ctb-mode-btn">전체</button>
+        <button id="ctb-mode-code" class="ctb-mode-btn ctb-mode-active">코드</button>
+      </div>
+      <div id="ctb-status"></div>
+    </div>
+  `;
+
+  const style = document.createElement('style');
+  style.textContent = `
+    #ctb-panel {
+      position: fixed; bottom: 80px; right: 16px; z-index: 99999;
+      background: #1a1a2e; border: 1px solid #3a3a5c; border-radius: 12px;
+      padding: 9px 10px; width: 130px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      user-select: none;
+    }
+    #ctb-title {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 7px; cursor: grab;
+    }
+    #ctb-title:active { cursor: grabbing; }
+    #ctb-title-text {
+      font-size: 10px; font-weight: 600; color: #a78bfa;
+      letter-spacing: 0.5px; flex: 1; text-align: center;
+    }
+    #ctb-controls { display: flex; gap: 2px; flex-shrink: 0; }
+    #ctb-controls button {
+      background: none; border: none; color: #555; font-size: 11px;
+      cursor: pointer; padding: 0 3px; line-height: 1;
+      border-radius: 3px; transition: color 0.15s;
+    }
+    #ctb-controls button:hover { color: #a78bfa; }
+    #ctb-refresh { font-size: 13px !important; }
+    #ctb-refresh.spinning { animation: ctb-spin 0.5s linear; }
+    @keyframes ctb-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .ctb-btn {
+      display: block; width: 100%; padding: 6px 8px;
+      border: none; border-radius: 7px; font-size: 10px; font-weight: 500;
+      cursor: pointer; margin-bottom: 5px; transition: opacity 0.15s;
+      color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .ctb-btn:hover { opacity: 0.85; }
+    .ctb-btn:active { opacity: 0.65; }
+    .ctb-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .ctb-tg { background: #2AABEE; }
+    .ctb-cl { background: #cc785c; }
+    #ctb-autosend-label {
+      display: flex; align-items: center; gap: 4px;
+      margin-top: 2px; cursor: pointer; user-select: none;
+    }
+    #ctb-autosend-label span { font-size: 9px; color: #a0a0b0; line-height: 1.2; }
+    #ctb-autosend { width: 11px; height: 11px; accent-color: #2AABEE; cursor: pointer; flex-shrink: 0; }
+    #ctb-mode-row {
+      display: flex; gap: 4px; margin-top: 5px;
+    }
+    .ctb-mode-btn {
+      flex: 1; padding: 3px 0; font-size: 9px; font-weight: 600;
+      border: 1px solid #333355; border-radius: 5px;
+      background: none; color: #555577; cursor: pointer; transition: all 0.15s;
+    }
+    .ctb-mode-btn:hover { border-color: #a78bfa; color: #a78bfa; }
+    .ctb-mode-active { background: #2a2a55 !important; border-color: #a78bfa !important; color: #a78bfa !important; }
+    #ctb-status {
+      margin-top: 6px; font-size: 9px; text-align: center;
+      min-height: 12px; color: #a0a0b0; line-height: 1.3;
+      word-break: keep-all; white-space: pre-wrap;
+    }
+    #ctb-status.ok  { color: #4ade80; }
+    #ctb-status.err { color: #f87171; }
+    #ctb-token-counter {
+      position: absolute; font-size: 10px; color: #888;
+      pointer-events: none; z-index: 99998; background: transparent; transition: color 0.2s;
+    }
+    #ctb-token-counter.warn   { color: #f59e0b; }
+    #ctb-token-counter.danger { color: #f87171; }
+  `;
+
+  document.head.appendChild(style);
+  document.body.appendChild(panel);
+
+  // ── 드래그 ──
+  const title = document.getElementById('ctb-title');
+  let dragging = false, dragX = 0, dragY = 0;
+  title.addEventListener('mousedown', (e) => {
+    dragging = true;
+    dragX = e.clientX - panel.getBoundingClientRect().left;
+    dragY = e.clientY - panel.getBoundingClientRect().top;
+    panel.style.right = 'auto'; panel.style.bottom = 'auto';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    panel.style.left = (e.clientX - dragX) + 'px';
+    panel.style.top  = (e.clientY - dragY) + 'px';
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+
+  // ── 컨트롤 버튼 ──
+  document.getElementById('ctb-refresh').addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.getElementById('ctb-refresh').classList.add('spinning');
+    setTimeout(() => location.reload(), 400);
+  });
+
+  let isMinimized = false;
+  const body = document.getElementById('ctb-body');
+
+  function minimize() {
+    isMinimized = true;
+    body.style.display = 'none';
+    document.getElementById('ctb-controls').style.display = 'none';
+    panel.style.width = '36px'; panel.style.height = '36px';
+    panel.style.borderRadius = '50%'; panel.style.padding = '0';
+    panel.style.display = 'flex'; panel.style.justifyContent = 'center'; panel.style.alignItems = 'center';
+    panel.style.cursor = 'pointer';
+    document.getElementById('ctb-title').style.marginBottom = '0';
+    document.getElementById('ctb-title').style.cursor = 'pointer';
+    document.getElementById('ctb-title-text').style.fontSize = '18px';
+    document.getElementById('ctb-title-text').textContent = '🔗';
+  }
+
+  function restore() {
+    isMinimized = false;
+    body.style.display = '';
+    document.getElementById('ctb-controls').style.display = '';
+    panel.style.width = '130px'; panel.style.height = '';
+    panel.style.borderRadius = '12px'; panel.style.padding = '9px 10px';
+    panel.style.display = ''; panel.style.justifyContent = ''; panel.style.alignItems = '';
+    panel.style.cursor = '';
+    document.getElementById('ctb-title').style.marginBottom = '7px';
+    document.getElementById('ctb-title').style.cursor = 'grab';
+    document.getElementById('ctb-title-text').style.fontSize = '10px';
+    document.getElementById('ctb-title-text').textContent = `🔗 ${SITE_NAME}`;
+  }
+
+  document.getElementById('ctb-minimize').addEventListener('click', (e) => { e.stopPropagation(); minimize(); });
+  panel.addEventListener('click', () => { if (isMinimized) restore(); });
+  document.getElementById('ctb-close').addEventListener('click', (e) => { e.stopPropagation(); panel.style.display = 'none'; });
+
+  // ── 복사 모드 토글 ──
+  const modeFullBtn = document.getElementById('ctb-mode-full');
+  const modeCodeBtn = document.getElementById('ctb-mode-code');
+
+  modeFullBtn.addEventListener('click', () => {
+    copyMode = 'full';
+    modeFullBtn.classList.add('ctb-mode-active');
+    modeCodeBtn.classList.remove('ctb-mode-active');
+  });
+  modeCodeBtn.addEventListener('click', () => {
+    copyMode = 'code';
+    modeCodeBtn.classList.add('ctb-mode-active');
+    modeFullBtn.classList.remove('ctb-mode-active');
+  });
+
+  // ── 상태 ──
+  const statusEl = document.getElementById('ctb-status');
+  const btn1 = document.getElementById('ctb-btn1');
+  const btn2 = document.getElementById('ctb-btn2');
+
+  function setStatus(msg, type = '') { statusEl.textContent = msg; statusEl.className = type; }
+  function setBtnsDisabled(v) { btn1.disabled = v; btn2.disabled = v; }
+
+  // ── 버튼 1: AI → Telegram ──
+  btn1.addEventListener('click', () => {
+    const autoSend = document.getElementById('ctb-autosend').checked;
+    setBtnsDisabled(true);
+    setStatus('⏳ 처리 중...');
+    chrome.runtime.sendMessage({ action: 'aiToTelegram', autoSend }, (res) => {
+      setBtnsDisabled(false);
+      if (chrome.runtime.lastError) { setStatus(`❌ ${chrome.runtime.lastError.message}`, 'err'); return; }
+      if (res?.ok) setStatus('✅ Telegram 전송!', 'ok');
+      else         setStatus(`❌ ${res?.error || '실패'}`, 'err');
+    });
+  });
+
+  // ── 버튼 2: Telegram → AI ──
+  btn2.addEventListener('click', () => {
+    const autoSend = document.getElementById('ctb-autosend').checked;
+    setBtnsDisabled(true);
+    setStatus('⏳ 처리 중...');
+    chrome.runtime.sendMessage({ action: 'telegramToAI', autoSend }, (res) => {
+      setBtnsDisabled(false);
+      if (chrome.runtime.lastError) { setStatus(`❌ ${chrome.runtime.lastError.message}`, 'err'); return; }
+      if (res?.ok) setStatus(autoSend ? `✅ ${SITE_NAME} 전송!` : `✅ ${SITE_NAME} 입력!`, 'ok');
+      else         setStatus(`❌ ${res?.error || '실패'}`, 'err');
+    });
+  });
+}
+
+// ────────────────────────────────────────
+// 토큰 카운터
+// ────────────────────────────────────────
+function injectTokenCounter() {
+  if (document.getElementById('ctb-token-counter')) return;
+  const counter = document.createElement('div');
+  counter.id = 'ctb-token-counter';
+  document.body.appendChild(counter);
+
+  function update() {
+    const input = getInputEl();
+    if (!input) { counter.textContent = ''; return; }
+    const rect   = input.getBoundingClientRect();
+    const text   = input.innerText || input.value || '';
+    const tokens = estimateTokens(text);
+    if (!text.trim()) { counter.textContent = ''; return; }
+    counter.style.left = (rect.right - 65 + window.scrollX) + 'px';
+    counter.style.top  = (rect.bottom - 18 + window.scrollY) + 'px';
+    counter.textContent = `~${tokens} tokens`;
+    counter.className = tokens > 3000 ? 'danger' : tokens > 1500 ? 'warn' : '';
+  }
+
+  document.addEventListener('input', update, true);
+  setInterval(update, 800);
+}
+
+// ────────────────────────────────────────
+// 메시지 리스너
+// ────────────────────────────────────────
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.action === 'getResponse') {
+    sendResponse({ text: getResponse() });
+    return true;
+  }
+  if (msg.action === 'checkStreaming') {
+    sendResponse({ streaming: isStreaming() });
+    return true;
+  }
+  if (msg.action === 'pasteToAI') {
+    pasteToAI(msg.text, msg.autoSend).then(sendResponse);
+    return true;
+  }
+  if (msg.action === 'getTelegramMessage') {
+    sendResponse({ text: telegram_getLastMessage() });
+    return true;
+  }
+  if (msg.action === 'sendToTelegram') {
+    telegram_sendMessage(msg.text, msg.autoSend).then(sendResponse);
+    return true;
+  }
+});
+
+// ── AI 사이트에서만 UI 주입 ──
+if (SITE && SITE !== 'telegram') {
+  if (document.body) {
+    injectFloatingUI();
+    injectTokenCounter();
+  } else {
+    document.addEventListener('DOMContentLoaded', () => {
+      injectFloatingUI();
+      injectTokenCounter();
+    });
+  }
+}

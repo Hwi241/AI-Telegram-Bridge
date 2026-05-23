@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "AI ↔ Telegram Bridge",
+  "version": "5.0",
+  "description": "Claude, ChatGPT, Gemini ↔ Telegram 연동. 플로팅 패널 + 토큰 카운터.",
+  "permissions": [
+    "scripting",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "https://chat.openai.com/*",
+    "https://chatgpt.com/*",
+    "https://gemini.google.com/*",
+    "https://web.telegram.org/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AI ↔ Telegram Bridge"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://gemini.google.com/*",
+        "https://web.telegram.org/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
