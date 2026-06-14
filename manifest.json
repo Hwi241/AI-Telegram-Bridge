@@ -6,14 +6,16 @@
   "permissions": [
     "scripting",
     "tabs",
-    "storage"
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
     "https://claude.ai/*",
     "https://chat.openai.com/*",
     "https://chatgpt.com/*",
     "https://gemini.google.com/*",
-    "https://web.telegram.org/*"
+    "https://web.telegram.org/*",
+    "https://api.deepseek.com/*"
   ],
   "action": {
     "default_popup": "popup.html",
@@ -31,7 +33,9 @@
         "https://gemini.google.com/*",
         "https://web.telegram.org/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ]

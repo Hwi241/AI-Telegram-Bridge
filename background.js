@@ -95,6 +95,207 @@ async function handleTelegramToAi(senderTabId, autoSend, tgCopyMode, aiTarget, t
   return sendToTab(aiTab.id, { action: 'pasteToAI', text: tgRes.text, autoSend });
 }
 
+
+
+// ────────────────────────────────────────
+// DeepSeek API 잔액 모니터
+// ────────────────────────────────────────
+const DEEPSEEK_BALANCE_ENDPOINT = 'https://api.deepseek.com/user/balance';
+const DEEPSEEK_BALANCE_ALARM = 'deepseek-balance-1m';
+const DEEPSEEK_API_KEY_KEY = 'bridge_deepseek_api_key';
+const DEEPSEEK_BALANCE_STATE_KEY = 'bridge_deepseek_balance_state';
+const DEEPSEEK_USAGE_HISTORY_KEY = 'bridge_deepseek_usage_history';
+const DEEPSEEK_USAGE_HISTORY_LIMIT = 50;
+
+function bridgeStorageGet(keys) {
+  return new Promise(resolve => chrome.storage.local.get(keys, resolve));
+}
+
+function bridgeStorageSet(values) {
+  return new Promise(resolve => chrome.storage.local.set(values, resolve));
+}
+
+function pickDeepSeekBalanceInfo(balanceInfos) {
+  if (!Array.isArray(balanceInfos) || !balanceInfos.length) return null;
+  const usd = balanceInfos.find(function(info) {
+    return info && info.currency === 'USD';
+  });
+  return usd || balanceInfos[0] || null;
+}
+
+function roundMoney(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 1000000) / 1000000;
+}
+
+function createDeepSeekBalanceStatePatch(patch) {
+  return Object.assign({
+    configured: false,
+    status: 'idle',
+    currency: 'USD',
+    amount: null,
+    isAvailable: false,
+    updatedAt: Date.now(),
+    error: ''
+  }, patch || {});
+}
+
+async function fetchDeepSeekBalance() {
+  const store = await bridgeStorageGet([
+    DEEPSEEK_API_KEY_KEY,
+    DEEPSEEK_BALANCE_STATE_KEY,
+    DEEPSEEK_USAGE_HISTORY_KEY
+  ]);
+
+  const apiKey = (store[DEEPSEEK_API_KEY_KEY] || '').trim();
+  const previousState = store[DEEPSEEK_BALANCE_STATE_KEY] || null;
+  const previousHistory = Array.isArray(store[DEEPSEEK_USAGE_HISTORY_KEY])
+    ? store[DEEPSEEK_USAGE_HISTORY_KEY]
+    : [];
+
+  if (!apiKey) {
+    const noKeyState = createDeepSeekBalanceStatePatch({
+      configured: false,
+      status: 'no_key',
+      amount: null,
+      error: 'API 키 없음'
+    });
+
+    await bridgeStorageSet({
+      [DEEPSEEK_BALANCE_STATE_KEY]: noKeyState
+    });
+
+    return {
+      ok: false,
+      error: 'API 키 없음',
+      state: noKeyState,
+      history: previousHistory
+    };
+  }
+
+  try {
+    const response = await fetch(DEEPSEEK_BALANCE_ENDPOINT, {
+      method: 'GET',
+      headers: {
+        Authorization: 'Bearer ' + apiKey,
+        Accept: 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error('HTTP ' + response.status);
+    }
+
+    const json = await response.json();
+    const info = pickDeepSeekBalanceInfo(json.balance_infos);
+
+    if (!info) {
+      throw new Error('잔액 정보 없음');
+    }
+
+    const currency = info.currency || 'USD';
+    const currentAmount = roundMoney(info.total_balance);
+    const now = Date.now();
+
+    const nextState = createDeepSeekBalanceStatePatch({
+      configured: true,
+      status: 'ok',
+      currency: currency,
+      amount: currentAmount,
+      isAvailable: !!json.is_available,
+      updatedAt: now,
+      error: ''
+    });
+
+    let nextHistory = previousHistory.slice(0, DEEPSEEK_USAGE_HISTORY_LIMIT);
+
+    if (
+      previousState &&
+      previousState.status === 'ok' &&
+      previousState.currency === currency &&
+      Number.isFinite(Number(previousState.amount)) &&
+      Number(previousState.amount) > currentAmount
+    ) {
+      const usedAmount = roundMoney(Number(previousState.amount) - currentAmount);
+
+      if (usedAmount > 0) {
+        nextHistory = [{
+          amount: usedAmount,
+          currency: currency,
+          timestamp: now,
+          previousAmount: roundMoney(previousState.amount),
+          currentAmount: currentAmount
+        }].concat(nextHistory).slice(0, DEEPSEEK_USAGE_HISTORY_LIMIT);
+      }
+    }
+
+    await bridgeStorageSet({
+      [DEEPSEEK_BALANCE_STATE_KEY]: nextState,
+      [DEEPSEEK_USAGE_HISTORY_KEY]: nextHistory
+    });
+
+    return {
+      ok: true,
+      state: nextState,
+      history: nextHistory
+    };
+  } catch (e) {
+    const errorState = createDeepSeekBalanceStatePatch({
+      configured: true,
+      status: 'error',
+      currency: previousState && previousState.currency ? previousState.currency : 'USD',
+      amount: previousState && Number.isFinite(Number(previousState.amount)) ? Number(previousState.amount) : null,
+      isAvailable: previousState ? !!previousState.isAvailable : false,
+      updatedAt: Date.now(),
+      error: e && e.message ? e.message : String(e)
+    });
+
+    await bridgeStorageSet({
+      [DEEPSEEK_BALANCE_STATE_KEY]: errorState
+    });
+
+    return {
+      ok: false,
+      error: errorState.error,
+      state: errorState,
+      history: previousHistory
+    };
+  }
+}
+
+function ensureDeepSeekBalanceAlarm() {
+  if (!chrome.alarms || !chrome.alarms.create) return;
+
+  chrome.alarms.create(DEEPSEEK_BALANCE_ALARM, {
+    periodInMinutes: 1
+  });
+}
+
+ensureDeepSeekBalanceAlarm();
+
+if (chrome.runtime && chrome.runtime.onInstalled) {
+  chrome.runtime.onInstalled.addListener(function() {
+    ensureDeepSeekBalanceAlarm();
+    fetchDeepSeekBalance().catch(function() {});
+  });
+}
+
+if (chrome.runtime && chrome.runtime.onStartup) {
+  chrome.runtime.onStartup.addListener(function() {
+    ensureDeepSeekBalanceAlarm();
+    fetchDeepSeekBalance().catch(function() {});
+  });
+}
+
+if (chrome.alarms && chrome.alarms.onAlarm) {
+  chrome.alarms.onAlarm.addListener(function(alarm) {
+    if (alarm && alarm.name === DEEPSEEK_BALANCE_ALARM) {
+      fetchDeepSeekBalance().catch(function() {});
+    }
+  });
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const aiTabId = sender.tab?.id;
 

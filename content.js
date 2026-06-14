@@ -362,6 +362,64 @@ const PANEL_STYLES = `
     .ctb-btn:hover { opacity: 0.85; }
     .ctb-btn:active { opacity: 0.65; }
     .ctb-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    #ctb-deepseek-balance-row {
+      display: flex !important;
+      gap: 4px !important;
+      width: 100% !important;
+      margin-bottom: 5px !important;
+      align-items: center !important;
+    }
+    #ctb-deepseek-current,
+    #ctb-deepseek-usage {
+      height: 22px !important;
+      min-width: 0 !important;
+      border: 1px solid #333366 !important;
+      border-radius: 6px !important;
+      background: #111122 !important;
+      color: #facc15 !important;
+      font-size: 9px !important;
+      font-weight: 700 !important;
+      line-height: 20px !important;
+      text-align: center !important;
+      white-space: nowrap !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+    }
+    #ctb-deepseek-current {
+      flex: 1 !important;
+      padding: 0 3px !important;
+    }
+    #ctb-deepseek-usage {
+      flex: 1.15 !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      padding: 0 2px !important;
+    }
+    .ctb-deepseek-arrow {
+      width: 14px !important;
+      height: 20px !important;
+      border: none !important;
+      background: transparent !important;
+      color: #a78bfa !important;
+      font-size: 10px !important;
+      font-weight: 700 !important;
+      line-height: 20px !important;
+      padding: 0 !important;
+      cursor: pointer !important;
+      flex-shrink: 0 !important;
+    }
+    .ctb-deepseek-arrow:disabled {
+      opacity: 0.25 !important;
+      cursor: default !important;
+    }
+    #ctb-deepseek-usage-value {
+      flex: 1 !important;
+      min-width: 0 !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      text-align: center !important;
+    }
     .ctb-tg { background: #2AABEE !important; }
     .ctb-cls { background: #a78bfa !important; }
     #ctb-ai-autosend-label, #ctb-tg-autosend-label {
@@ -577,6 +635,13 @@ function injectAIWidget() {
       </div>
     </div>
     <div id="ctb-body">
+      <div id="ctb-deepseek-balance-row">
+        <div id="ctb-deepseek-current" title="DeepSeek 현재 잔액">$KEY</div>
+        <div id="ctb-deepseek-usage" title="기록된 1분 사용금액"><button id="ctb-deepseek-prev" class="ctb-deepseek-arrow" title="이전 사용 기록">&lt;</button>
+          <span id="ctb-deepseek-usage-value">$0.00</span>
+          <button id="ctb-deepseek-next" class="ctb-deepseek-arrow" title="다음 사용 기록">&gt;</button>
+        </div>
+      </div>
       <button id="ctb-ai-btn1" class="ctb-btn ctb-tg">📤 → Telegram</button>
       <select id="ctb-ai-source-select" style="width:100%;margin-bottom:5px;padding:2px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;"><option value="">AI 탭 목록 받는 중...</option></select>
       <div id="ctb-ai-current-tab-label" style="display:none;width:100%;margin-bottom:5px;padding:3px 4px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></div>
@@ -683,6 +748,163 @@ function injectAIWidget() {
   const statusEl = panel.querySelector('#ctb-status');
   const btn1 = panel.querySelector('#ctb-ai-btn1');
   const autoCheck = panel.querySelector('#ctb-ai-autosend');
+  const deepSeekCurrentEl = panel.querySelector('#ctb-deepseek-current');
+  const deepSeekUsageEl = panel.querySelector('#ctb-deepseek-usage');
+  const deepSeekUsageValueEl = panel.querySelector('#ctb-deepseek-usage-value');
+  const deepSeekPrevBtn = panel.querySelector('#ctb-deepseek-prev');
+  const deepSeekNextBtn = panel.querySelector('#ctb-deepseek-next');
+  let deepSeekBalanceState = null;
+  let deepSeekUsageHistory = [];
+  let deepSeekUsageIndex = 0;
+
+  function formatDeepSeekMoney(amount, currency) {
+    const n = Number(amount);
+    if (!Number.isFinite(n)) {
+      if (currency === 'CNY') return '¥--';
+      if (currency && currency !== 'USD') return currency + ' --';
+      return '$--';
+    }
+    if (currency === 'CNY') return '¥' + n.toFixed(2);
+    if (currency && currency !== 'USD') return currency + ' ' + n.toFixed(2);
+    return '$' + n.toFixed(2);
+  }
+
+  function formatDeepSeekRecordTime(timestamp) {
+    if (!timestamp) return '';
+    const d = new Date(timestamp);
+    const yy = String(d.getFullYear()).slice(-2);
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mi = String(d.getMinutes()).padStart(2, '0');
+    return yy + '.' + mm + '.' + dd + ' ' + hh + ':' + mi;
+  }
+
+  function clampDeepSeekUsageIndex() {
+    if (!deepSeekUsageHistory.length) {
+      deepSeekUsageIndex = 0;
+      return;
+    }
+    if (deepSeekUsageIndex < 0) deepSeekUsageIndex = 0;
+    if (deepSeekUsageIndex > deepSeekUsageHistory.length - 1) {
+      deepSeekUsageIndex = deepSeekUsageHistory.length - 1;
+    }
+  }
+
+  function renderDeepSeekBalanceBox() {
+    if (!deepSeekCurrentEl || !deepSeekUsageEl || !deepSeekUsageValueEl) return;
+
+    const state = deepSeekBalanceState;
+
+    if (!state || !state.configured) {
+      deepSeekCurrentEl.textContent = '$KEY';
+      deepSeekCurrentEl.title = '설정창에서 DeepSeek API 키를 저장하세요.';
+    } else if (state.status === 'error') {
+      deepSeekCurrentEl.textContent = '$ERR';
+      deepSeekCurrentEl.title = state.error || 'DeepSeek 잔액 조회 실패';
+    } else if (state.status === 'ok') {
+      deepSeekCurrentEl.textContent = formatDeepSeekMoney(state.amount, state.currency || 'USD');
+      deepSeekCurrentEl.title = 'DeepSeek 현재 잔액' + (state.updatedAt ? ' / ' + formatDeepSeekRecordTime(state.updatedAt) : '');
+    } else {
+      deepSeekCurrentEl.textContent = '$--';
+      deepSeekCurrentEl.title = 'DeepSeek 잔액 대기 중';
+    }
+
+    clampDeepSeekUsageIndex();
+
+    const record = deepSeekUsageHistory[deepSeekUsageIndex] || null;
+    const fallbackCurrency = state && state.currency ? state.currency : 'USD';
+
+    if (record) {
+      deepSeekUsageValueEl.textContent = formatDeepSeekMoney(record.amount, record.currency || fallbackCurrency);
+      deepSeekUsageEl.title = formatDeepSeekRecordTime(record.timestamp);
+    } else {
+      deepSeekUsageValueEl.textContent = formatDeepSeekMoney(0, fallbackCurrency);
+      deepSeekUsageEl.title = '기록된 사용금액 없음';
+    }
+
+    if (deepSeekPrevBtn) {
+      deepSeekPrevBtn.disabled = !deepSeekUsageHistory.length || deepSeekUsageIndex >= deepSeekUsageHistory.length - 1;
+    }
+    if (deepSeekNextBtn) {
+      deepSeekNextBtn.disabled = !deepSeekUsageHistory.length || deepSeekUsageIndex <= 0;
+    }
+  }
+
+  function applyDeepSeekBalanceResponse(res) {
+    if (!res || !res.ok) {
+      if (!deepSeekBalanceState) {
+        deepSeekBalanceState = {
+          configured: false,
+          status: 'idle',
+          currency: 'USD',
+          amount: null
+        };
+      }
+      renderDeepSeekBalanceBox();
+      return;
+    }
+    deepSeekBalanceState = res.state || null;
+    deepSeekUsageHistory = Array.isArray(res.history) ? res.history : [];
+    clampDeepSeekUsageIndex();
+    renderDeepSeekBalanceBox();
+  }
+
+  function refreshDeepSeekBalanceBox() {
+    try {
+      chrome.runtime.sendMessage({ action: 'getDeepSeekBalanceState' }, function(res) {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          renderDeepSeekBalanceBox();
+          return;
+        }
+        applyDeepSeekBalanceResponse(res);
+      });
+    } catch (e) {
+      renderDeepSeekBalanceBox();
+    }
+  }
+
+  if (deepSeekPrevBtn) {
+    deepSeekPrevBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (deepSeekUsageIndex < deepSeekUsageHistory.length - 1) {
+        deepSeekUsageIndex += 1;
+        renderDeepSeekBalanceBox();
+      }
+    });
+  }
+
+  if (deepSeekNextBtn) {
+    deepSeekNextBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (deepSeekUsageIndex > 0) {
+        deepSeekUsageIndex -= 1;
+        renderDeepSeekBalanceBox();
+      }
+    });
+  }
+
+  refreshDeepSeekBalanceBox();
+  setInterval(refreshDeepSeekBalanceBox, 15000);
+
+  if (chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener(function(changes, areaName) {
+      if (areaName !== 'local') return;
+      if (changes.bridge_deepseek_balance_state || changes.bridge_deepseek_usage_history) {
+        if (changes.bridge_deepseek_balance_state) {
+          deepSeekBalanceState = changes.bridge_deepseek_balance_state.newValue || null;
+        }
+        if (changes.bridge_deepseek_usage_history) {
+          deepSeekUsageHistory = Array.isArray(changes.bridge_deepseek_usage_history.newValue)
+            ? changes.bridge_deepseek_usage_history.newValue
+            : [];
+        }
+        clampDeepSeekUsageIndex();
+        renderDeepSeekBalanceBox();
+      }
+    });
+  }
   const AI_SOURCE_COLORS = { chatgpt: '#10A37F', claude: '#D97757', gemini: '#EA4335' };
   let aiSourceTarget = null;
   const aiSourceSelect = panel.querySelector('#ctb-ai-source-select');

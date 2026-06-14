@@ -6,39 +6,155 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      width: 240px;
+      width: 260px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #1a1a2e; color: #e0e0e0; padding: 16px;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 16px;
     }
-    h2 { font-size: 13px; color: #a78bfa; text-align: center; margin-bottom: 14px; }
-    .badges { text-align: center; margin-bottom: 14px; }
+    h2 {
+      font-size: 13px;
+      color: #a78bfa;
+      text-align: center;
+      margin-bottom: 14px;
+    }
+    .badges {
+      text-align: center;
+      margin-bottom: 14px;
+    }
     .badge {
-      display: inline-block; background: #222244;
-      border: 1px solid #333366; border-radius: 6px;
-      padding: 3px 8px; font-size: 10px; margin: 2px; color: #8888cc;
+      display: inline-block;
+      background: #222244;
+      border: 1px solid #333366;
+      border-radius: 6px;
+      padding: 3px 8px;
+      font-size: 10px;
+      margin: 2px;
+      color: #8888cc;
     }
-    .label { font-size: 10px; color: #555577; margin-bottom: 6px; font-weight: 600; }
-    .step { font-size: 10px; color: #888; margin-bottom: 4px; line-height: 1.5; }
-    .step b { color: #a78bfa; }
-    .divider { height: 1px; background: #222240; margin: 12px 0; }
-    .note { font-size: 9px; color: #444466; text-align: center; line-height: 1.4; }
+    .label {
+      font-size: 10px;
+      color: #7777aa;
+      margin-bottom: 6px;
+      font-weight: 700;
+    }
+    .step {
+      font-size: 10px;
+      color: #888;
+      margin-bottom: 4px;
+      line-height: 1.5;
+    }
+    .step b {
+      color: #a78bfa;
+    }
+    .divider {
+      height: 1px;
+      background: #222240;
+      margin: 12px 0;
+    }
+    .note {
+      font-size: 9px;
+      color: #555577;
+      text-align: center;
+      line-height: 1.4;
+    }
+    .api-box {
+      background: #111122;
+      border: 1px solid #333366;
+      border-radius: 8px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+    .api-row {
+      display: flex;
+      gap: 5px;
+      margin-top: 6px;
+    }
+    #deepseek-api-key {
+      width: 100%;
+      border: 1px solid #3a3a5c;
+      background: #222244;
+      color: #e0e0e0;
+      border-radius: 6px;
+      padding: 6px 7px;
+      font-size: 10px;
+      outline: none;
+    }
+    #deepseek-api-key::placeholder {
+      color: #666699;
+    }
+    .small-btn {
+      flex: 1;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 5px;
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      color: #fff;
+    }
+    #save-deepseek-key {
+      background: #10A37F;
+    }
+    #clear-deepseek-key {
+      background: #5a3340;
+    }
+    #refresh-deepseek-balance {
+      background: #2AABEE;
+    }
+    #deepseek-key-status {
+      margin-top: 7px;
+      min-height: 13px;
+      font-size: 9px;
+      color: #8888cc;
+      line-height: 1.4;
+      word-break: break-all;
+    }
+    #deepseek-balance-status {
+      margin-top: 6px;
+      min-height: 13px;
+      font-size: 9px;
+      color: #c4b5fd;
+      line-height: 1.4;
+    }
   </style>
 </head>
 <body>
   <h2>🔗 AI ↔ Telegram Bridge</h2>
+
   <div class="badges">
     <span class="badge">Claude</span>
     <span class="badge">ChatGPT</span>
     <span class="badge">Gemini</span>
   </div>
+
+  <div class="api-box">
+    <div class="label">DeepSeek API Key</div>
+    <input id="deepseek-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-... 입력 후 저장" />
+    <div class="api-row">
+      <button id="save-deepseek-key" class="small-btn">저장</button>
+      <button id="clear-deepseek-key" class="small-btn">삭제</button>
+      <button id="refresh-deepseek-balance" class="small-btn">조회</button>
+    </div>
+    <div id="deepseek-key-status">API 키 상태 확인 중...</div>
+    <div id="deepseek-balance-status"></div>
+  </div>
+
   <div class="label">사용법</div>
   <div class="step">1. <b>web.telegram.org</b> 탭 열기</div>
   <div class="step">2. 봇 채팅방 선택</div>
   <div class="step">3. AI 사이트의 플로팅 패널 이용</div>
+
   <div class="divider"></div>
+
   <div class="step">📤 → Telegram: AI 응답을 봇으로 전송</div>
   <div class="step">📥 → AI: 봇 메시지를 AI 입력창에 붙여넣기</div>
+
   <div class="divider"></div>
+
+  <div class="note">API 키는 chrome.storage.local에만 저장되고 content.js로 전달하지 않습니다.</div>
   <div class="note">플로팅 패널이 안 보이면 페이지를 새로고침하세요</div>
+
+  <script src="popup.js"></script>
 </body>
 </html>
