@@ -364,10 +364,11 @@ const PANEL_STYLES = `
     .ctb-btn:disabled { opacity: 0.4; cursor: not-allowed; }
     #ctb-deepseek-balance-row {
       display: flex !important;
-      gap: 4px !important;
+      flex-direction: column !important;
+      gap: 3px !important;
       width: 100% !important;
       margin-bottom: 5px !important;
-      align-items: center !important;
+      align-items: stretch !important;
     }
     #ctb-deepseek-current,
     #ctb-deepseek-usage {
@@ -386,11 +387,13 @@ const PANEL_STYLES = `
       text-overflow: ellipsis !important;
     }
     #ctb-deepseek-current {
-      flex: 1 !important;
+      flex: none !important;
+      width: 100% !important;
       padding: 0 3px !important;
     }
     #ctb-deepseek-usage {
-      flex: 1.15 !important;
+      flex: none !important;
+      width: 100% !important;
       display: flex !important;
       align-items: center !important;
       justify-content: space-between !important;
