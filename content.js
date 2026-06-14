@@ -22,22 +22,93 @@ let copyMode = 'code'; // 기본값: 코드블록
 let tgCopyMode = 'all'; // 기본값: 답변전체
 
 // ── 공통 입력 함수 ──
+function normalizeBridgeText(text) {
+  return String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function getContentEditablePlainText(el) {
+  return normalizeBridgeText(el.innerText || el.textContent || '');
+}
+
+function setContentEditableTextWithBreaks(el, text) {
+  const normalizedText = normalizeBridgeText(text);
+
+  el.textContent = '';
+
+  const lines = normalizedText.split('\n');
+  lines.forEach(function(line, index) {
+    if (index > 0) {
+      el.appendChild(document.createElement('br'));
+    }
+    if (line) {
+      el.appendChild(document.createTextNode(line));
+    }
+  });
+
+  el.dispatchEvent(new InputEvent('input', {
+    bubbles: true,
+    cancelable: true,
+    data: normalizedText,
+    inputType: 'insertText'
+  }));
+}
+
+function dispatchPasteText(el, text) {
+  const normalizedText = normalizeBridgeText(text);
+
+  try {
+    const dataTransfer = new DataTransfer();
+    dataTransfer.setData('text/plain', normalizedText);
+
+    const pasteEvent = new ClipboardEvent('paste', {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: dataTransfer
+    });
+
+    el.dispatchEvent(pasteEvent);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function setInput(el, text) {
+  const normalizedText = normalizeBridgeText(text);
+
   el.focus();
+
   if (el.isContentEditable) {
     document.execCommand('selectAll', false, null);
-    document.execCommand('insertText', false, text);
-    if (!el.textContent.trim() || el.textContent.trim() !== text.trim()) {
-      el.textContent = text;
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: text, inputType: 'insertText' }));
-    }
-  } else {
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-    if (nativeSetter) nativeSetter.call(el, text);
-    else el.value = text;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
+
+    const pasteDispatched = dispatchPasteText(el, normalizedText);
+
+    setTimeout(function() {
+      const currentText = getContentEditablePlainText(el).trim();
+      const expectedText = normalizedText.trim();
+
+      if (!currentText || currentText !== expectedText) {
+        document.execCommand('selectAll', false, null);
+        const inserted = document.execCommand('insertText', false, normalizedText);
+
+        const afterInsertText = getContentEditablePlainText(el).trim();
+
+        if (!inserted || !afterInsertText || afterInsertText !== expectedText) {
+          document.execCommand('selectAll', false, null);
+          setContentEditableTextWithBreaks(el, normalizedText);
+        }
+      }
+    }, pasteDispatched ? 80 : 0);
+
+    return;
   }
+
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+  if (nativeSetter) nativeSetter.call(el, normalizedText);
+  else el.value = normalizedText;
+
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 // ── 토큰 추정 ──
