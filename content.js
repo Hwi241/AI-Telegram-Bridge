@@ -1,4 +1,9 @@
 (() => {
+if (window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__) {
+ return;
+}
+window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__ = true;
+
 // content.js v5.0
 // Claude, ChatGPT, Gemini, Telegram 범용 지원
 
@@ -423,6 +428,16 @@ const PANEL_STYLES = `
       text-overflow: ellipsis !important;
       text-align: center !important;
     }
+    #ctb-deepseek-balance-row.ctb-deepseek-peak #ctb-deepseek-current,
+    #ctb-deepseek-balance-row.ctb-deepseek-peak #ctb-deepseek-usage,
+    #ctb-deepseek-balance-row.ctb-deepseek-peak #ctb-deepseek-usage-value {
+      color: #f87171 !important;
+    }
+    #ctb-deepseek-balance-row.ctb-deepseek-peak #ctb-deepseek-current,
+    #ctb-deepseek-balance-row.ctb-deepseek-peak #ctb-deepseek-usage {
+      border-color: #7f1d1d !important;
+      background: #2a1118 !important;
+    }
     .ctb-tg { background: #2AABEE !important; }
     .ctb-cls { background: #a78bfa !important; }
     #ctb-ai-autosend-label, #ctb-tg-autosend-label {
@@ -482,35 +497,110 @@ const PANEL_STYLES = `
     .ctb-switch-btn:hover { color:#a78bfa; border-color:#a78bfa; }
 `;
 
+function clampPanelPosition(panel, left, top) {
+ const margin = 8;
+ const panelWidth = panel && panel.offsetWidth ? panel.offsetWidth : 110;
+ const panelHeight = panel && panel.offsetHeight ? panel.offsetHeight : 36;
+
+ let nextLeft = Number(left);
+ let nextTop = Number(top);
+
+ if (!Number.isFinite(nextLeft)) nextLeft = margin;
+ if (!Number.isFinite(nextTop)) nextTop = margin;
+
+ const maxLeft = Math.max(margin, window.innerWidth - panelWidth - margin);
+ const maxTop = Math.max(margin, window.innerHeight - panelHeight - margin);
+
+ nextLeft = Math.min(Math.max(margin, nextLeft), maxLeft);
+ nextTop = Math.min(Math.max(margin, nextTop), maxTop);
+
+ return {
+ left: Math.round(nextLeft),
+ top: Math.round(nextTop)
+ };
+}
+
+function savePanelPosition(panel, storageKey) {
+ if (!panel || !storageKey) return;
+
+ const currentLeft = parseInt(panel.style.left, 10);
+ const currentTop = parseInt(panel.style.top, 10);
+ const clamped = clampPanelPosition(panel, currentLeft, currentTop);
+
+ panel.style.right = 'auto';
+ panel.style.bottom = 'auto';
+ panel.style.left = clamped.left + 'px';
+ panel.style.top = clamped.top + 'px';
+
+ chrome.storage.local.set({
+ [storageKey]: {
+ left: clamped.left,
+ top: clamped.top
+ }
+ });
+}
+
+function applyStoredPanelPosition(panel, storageKey, pos) {
+ if (!panel || !pos) return;
+
+ setTimeout(function() {
+ const clamped = clampPanelPosition(panel, pos.left, pos.top);
+
+ panel.style.right = 'auto';
+ panel.style.bottom = 'auto';
+ panel.style.left = clamped.left + 'px';
+ panel.style.top = clamped.top + 'px';
+
+ if (
+ storageKey &&
+ (Number(pos.left) !== clamped.left || Number(pos.top) !== clamped.top)
+ ) {chrome.storage.local.set({
+ [storageKey]: {
+ left: clamped.left,
+ top: clamped.top
+ }
+ });
+ }
+ }, 0);
+}
+
 function makeDraggable(panel, handleSelector, storageKey) {
-  const handle = panel.querySelector(handleSelector);
-  if (!handle) return;
-  let dragging = false, dragX = 0, dragY = 0;
-  handle.addEventListener('mousedown', (e) => {
-    dragging = true;
-    dragX = e.clientX - panel.getBoundingClientRect().left;
-    dragY = e.clientY - panel.getBoundingClientRect().top;
-    panel.style.right = 'auto'; panel.style.bottom = 'auto';
-    panel.dataset.pinned = 'false';
-    e.preventDefault();
-  });
-  document.addEventListener('mousemove', (e) => {
-    if (!dragging) return;
-    panel.style.left = (e.clientX - dragX) + 'px';
-    panel.style.top  = (e.clientY - dragY) + 'px';
-  });
-  document.addEventListener('mouseup', () => {
-    if (!dragging) return;
-    dragging = false;
-    if (storageKey) {
-      chrome.storage.local.set({
-        [storageKey]: {
-          left: parseInt(panel.style.left) || 0,
-          top:  parseInt(panel.style.top)  || 0
-        }
-      });
-    }
-  });
+ const handle = panel.querySelector(handleSelector);
+ if (!handle) return;
+
+ let dragging = false;
+ let dragX = 0;
+ let dragY = 0;
+
+ handle.addEventListener('mousedown', (e) => {
+ dragging = true;
+ dragX = e.clientX - panel.getBoundingClientRect().left;
+ dragY = e.clientY - panel.getBoundingClientRect().top;
+ panel.style.right = 'auto';
+ panel.style.bottom = 'auto';
+ panel.dataset.pinned = 'false';
+ e.preventDefault();
+ });
+
+ document.addEventListener('mousemove', (e) => {
+ if (!dragging) return;
+
+ const clamped = clampPanelPosition(panel, e.clientX - dragX, e.clientY - dragY);
+
+ panel.style.left = clamped.left + 'px';
+ panel.style.top = clamped.top + 'px';
+ });
+
+ document.addEventListener('mouseup', () => {
+ if (!dragging) return;
+
+ dragging = false;
+ savePanelPosition(panel, storageKey);
+ });
+
+ window.addEventListener('resize', function() {
+ savePanelPosition(panel, storageKey);
+ });
 }
 
 function copyPanelPosition(fromPanel, toPanel, storageKey) {
@@ -530,6 +620,10 @@ function copyPanelPosition(fromPanel, toPanel, storageKey) {
   }
 
   if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+
+  const clamped = clampPanelPosition(toPanel, left, top);
+  left = clamped.left;
+  top = clamped.top;
 
   toPanel.style.right = 'auto';
   toPanel.style.bottom = 'auto';
@@ -666,9 +760,7 @@ function injectAIWidget() {
   // ── 위치 복원 ──
   chrome.storage.local.get(['widgetPos_ai'], (res) => {
     if (res?.widgetPos_ai) {
-      panel.style.right = 'auto'; panel.style.bottom = 'auto';
-      panel.style.left = res.widgetPos_ai.left + 'px';
-      panel.style.top  = res.widgetPos_ai.top  + 'px';
+      applyStoredPanelPosition(panel, 'widgetPos_ai', res.widgetPos_ai);
     }
   });
 
@@ -783,6 +875,21 @@ function injectAIWidget() {
     return yy + '.' + mm + '.' + dd + ' ' + hh + ':' + mi;
   }
 
+  function isDeepSeekPeakHourNow() {
+    const now = new Date();
+    const utcHour = now.getUTCHours();
+    return (utcHour >= 1 && utcHour < 4) || (utcHour >= 6 && utcHour < 10);
+  }
+
+  function applyDeepSeekPeakStyle() {
+    const row = panel.querySelector('#ctb-deepseek-balance-row');
+    if (!row) return;
+    const isPeak = isDeepSeekPeakHourNow();
+    row.classList.toggle('ctb-deepseek-peak', isPeak);
+    const peakTitle = 'DeepSeek 피크 시간: UTC 01:00-04:00 / 06:00-10:00';
+    row.title = isPeak ? peakTitle : 'DeepSeek 일반 시간';
+  }
+
   function clampDeepSeekUsageIndex() {
     if (!deepSeekUsageHistory.length) {
       deepSeekUsageIndex = 0;
@@ -796,6 +903,8 @@ function injectAIWidget() {
 
   function renderDeepSeekBalanceBox() {
     if (!deepSeekCurrentEl || !deepSeekUsageEl || !deepSeekUsageValueEl) return;
+
+    applyDeepSeekPeakStyle();
 
     const state = deepSeekBalanceState;
 
@@ -889,7 +998,12 @@ function injectAIWidget() {
   }
 
   refreshDeepSeekBalanceBox();
+  applyDeepSeekPeakStyle();
   setInterval(refreshDeepSeekBalanceBox, 15000);
+  setInterval(function() {
+    applyDeepSeekPeakStyle();
+    renderDeepSeekBalanceBox();
+  }, 60000);
 
   if (chrome.storage && chrome.storage.onChanged) {
     chrome.storage.onChanged.addListener(function(changes, areaName) {
@@ -1068,6 +1182,49 @@ function injectAIWidget() {
   }
 
   function updateStreamingState(streaming) {
+    // GPT 작성 중 감지는 기존 로직을 그대로 사용하고 완료 알림만 연결한다.
+    const bridgeAiNotifyNextStreaming = !!streaming;
+    const bridgeAiNotifyWasStreaming =
+      updateStreamingState.__bridgeAiNotifyWasStreaming === true;
+
+    updateStreamingState.__bridgeAiNotifyWasStreaming =
+      bridgeAiNotifyNextStreaming;
+    updateStreamingState.__bridgeAiNotifyConnected = true;
+
+    if (bridgeAiNotifyWasStreaming && !bridgeAiNotifyNextStreaming) {
+      const bridgeAiNotifyHost = String(location.hostname || '');
+      const bridgeAiNotifyIsAiPage =
+        bridgeAiNotifyHost === 'chatgpt.com' ||
+        bridgeAiNotifyHost === 'chat.openai.com' ||
+        bridgeAiNotifyHost === 'claude.ai' ||
+        bridgeAiNotifyHost === 'gemini.google.com';
+
+      const bridgeAiNotifyNow = Date.now();
+      const bridgeAiNotifyLastAt =
+        Number(updateStreamingState.__bridgeAiNotifyLastAt || 0);
+
+      if (
+        bridgeAiNotifyIsAiPage &&
+        bridgeAiNotifyNow - bridgeAiNotifyLastAt >= 10000 &&
+        typeof chrome !== 'undefined' &&
+        chrome.runtime &&
+        chrome.runtime.sendMessage
+      ) {
+        updateStreamingState.__bridgeAiNotifyLastAt = bridgeAiNotifyNow;
+
+        setTimeout(() => {
+          chrome.runtime.sendMessage({
+            action: 'bridgeNotifyComplete',
+            type: 'ai',
+            title: 'AI 응답 완료',
+            message: 'AI 응답 생성이 완료되었습니다. 클릭하면 해당 탭으로 이동합니다.'
+          }, () => {
+            void chrome.runtime.lastError;
+          });
+        }, 350);
+      }
+    }
+
     if (streaming === _prevStreaming) return;
     _prevStreaming = streaming;
     applyStreamingPanelState(streaming);
@@ -1174,9 +1331,7 @@ function injectTGWidget() {
   // ── 위치 복원 ──
   chrome.storage.local.get(['widgetPos_tg'], (res) => {
     if (res?.widgetPos_tg) {
-      panel.style.right = 'auto'; panel.style.bottom = 'auto';
-      panel.style.left = res.widgetPos_tg.left + 'px';
-      panel.style.top  = res.widgetPos_tg.top  + 'px';
+      applyStoredPanelPosition(panel, 'widgetPos_tg', res.widgetPos_tg);
     }
   });
 
@@ -1531,4 +1686,98 @@ if (SITE === 'telegram' || SITE) {
   else { document.addEventListener('DOMContentLoaded', onReady); }
 }
 
+})();
+// ────────────────────────────────────────
+// Telegram 새 답변/메시지 도착 알림 요청
+// ────────────────────────────────────────
+(function installBridgeTelegramNotificationHook() {
+ if (window.__AI_TELEGRAM_BRIDGE_TG_NOTIFY_HOOK__) return;
+ window.__AI_TELEGRAM_BRIDGE_TG_NOTIFY_HOOK__ = true;
+
+ function isBridgeTelegramPageForNotification() {
+ const href = String(location.href || '');
+ return href.indexOf('https://web.telegram.org/') === 0;
+ }
+
+ function getBridgeTelegramLatestMessageText() {
+ const candidates = Array.from(document.querySelectorAll(
+ '.message, .Message, [class*="message"], [data-message-id]'
+ ));
+
+ for (let i = candidates.length - 1; i >= 0; i -= 1) {
+ const el = candidates[i];
+ if (!el) continue;
+
+ const text = (el.innerText || el.textContent || '').trim();
+ if (!text) continue;
+ if (text.length < 2) continue;
+
+ return text.slice(0, 80);
+ }
+
+ return '';
+ }
+
+ function requestBridgeTelegramNotification(messageText) {
+ if (!isBridgeTelegramPageForNotification()) return;
+ if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) return;
+
+ const now = Date.now();
+ if (window.__AI_TELEGRAM_BRIDGE_LAST_TG_NOTIFY_AT__ &&
+ now - window.__AI_TELEGRAM_BRIDGE_LAST_TG_NOTIFY_AT__ < 10000) {
+ return;
+ }
+
+ window.__AI_TELEGRAM_BRIDGE_LAST_TG_NOTIFY_AT__ = now;
+
+ chrome.runtime.sendMessage({
+ action: 'bridgeNotifyComplete',
+ type: 'telegram',
+ title: 'Telegram 답변 도착',
+ message: messageText ? messageText : 'Telegram에 새 메시지가 도착했습니다. 클릭하면 해당 탭으로 이동합니다.'
+ }, () => {
+ void chrome.runtime.lastError;
+ });
+ }
+
+ function getBridgeTelegramMessageCount() {
+ return document.querySelectorAll('.message, .Message, [class*="message"], [data-message-id]').length;
+ }
+
+ if (!isBridgeTelegramPageForNotification()) return;
+
+ let initialized = false;
+ let lastCount = getBridgeTelegramMessageCount();
+
+ const observer = new MutationObserver(() => {
+ const nextCount = getBridgeTelegramMessageCount();
+
+ if (!initialized) {
+ initialized = true;
+ lastCount = nextCount;
+ return;
+ }
+
+ if (nextCount > lastCount) {
+ lastCount = nextCount;
+ const text = getBridgeTelegramLatestMessageText();
+
+ setTimeout(() => {
+ requestBridgeTelegramNotification(text);
+ }, 300);
+ return;
+ }
+
+ lastCount = nextCount;
+ });
+
+ observer.observe(document.body || document.documentElement, {
+ childList: true,
+ subtree: true
+ });
+
+ setTimeout(() => {
+ initialized = true;
+ lastCount = getBridgeTelegramMessageCount();
+ }, 2500);
 })();

@@ -296,6 +296,82 @@ if (chrome.alarms && chrome.alarms.onAlarm) {
   });
 }
 
+
+// ────────────────────────────────────────
+// 기존 탭 content.js 자동 주입
+//────────────────────────────────────────
+const BRIDGE_CONTENT_URL_PATTERNS = [
+ 'https://claude.ai/*',
+ 'https://chat.openai.com/*',
+ 'https://chatgpt.com/*',
+ 'https://gemini.google.com/*',
+ 'https://web.telegram.org/*'
+];
+
+function isBridgeContentUrl(url) {
+ if (!url) return false;
+
+ return url.indexOf('https://claude.ai/') === 0 ||
+ url.indexOf('https://chat.openai.com/') === 0 ||
+ url.indexOf('https://chatgpt.com/') === 0 ||
+ url.indexOf('https://gemini.google.com/') === 0 ||
+ url.indexOf('https://web.telegram.org/') === 0;
+}
+
+async function injectBridgeContentIntoTab(tabId) {
+ if (!tabId || !chrome.scripting || !chrome.scripting.executeScript) return false;
+
+ try {
+ await chrome.scripting.executeScript({
+ target: { tabId: tabId },
+ files: ['content.js']
+ });
+ return true;
+ } catch (e) {
+ return false;
+ }
+}
+
+async function injectBridgeContentIntoOpenTabs() {
+ if (!chrome.tabs || !chrome.tabs.query) return;
+
+ const tabs = await chrome.tabs.query({
+ url: BRIDGE_CONTENT_URL_PATTERNS
+ });
+
+ await Promise.all((tabs || []).map(function(tab) {
+ return injectBridgeContentIntoTab(tab.id);
+ }));
+}
+
+function scheduleBridgeContentInjection() {
+ setTimeout(function() {
+ injectBridgeContentIntoOpenTabs().catch(function() {});
+ }, 1200);
+}
+
+scheduleBridgeContentInjection();
+
+if (chrome.runtime && chrome.runtime.onInstalled) {
+ chrome.runtime.onInstalled.addListener(function() {
+ scheduleBridgeContentInjection();
+ });
+}
+
+if (chrome.runtime && chrome.runtime.onStartup) {
+ chrome.runtime.onStartup.addListener(function() {
+ scheduleBridgeContentInjection();
+ });
+}
+
+if (chrome.tabs && chrome.tabs.onUpdated) {
+ chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
+ if (changeInfo && changeInfo.status === 'complete' && tab && isBridgeContentUrl(tab.url)) {
+ injectBridgeContentIntoTab(tabId).catch(function() {});
+ }
+ });
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const aiTabId = sender.tab?.id;
 
@@ -374,3 +450,127 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 });
+
+// ────────────────────────────────────────
+// AI 완료 / Telegram 도착 알림
+// ────────────────────────────────────────
+const BRIDGE_NOTIFY_POPUP_ENABLED_KEY_BG = 'bridge_notify_popup_enabled';
+const BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY_BG = 'bridge_notify_attention_enabled';
+const BRIDGE_NOTIFICATION_PREFIX = 'bridge-complete-';
+
+function getBridgeNotificationIconUrl() {
+ try {
+ const manifest = chrome.runtime.getManifest();
+ const icons = manifest && manifest.icons ? manifest.icons : {};
+ const iconPath = icons['128'] || icons['48'] || icons['32'] || icons['16'];
+
+ if (iconPath) {
+ return chrome.runtime.getURL(iconPath);
+ }
+ } catch (e) {}
+
+ return chrome.runtime.getURL('bridge-notification-icon.svg');
+}
+
+function getBridgeNotifySettings(callback) {
+ chrome.storage.local.get({
+ [BRIDGE_NOTIFY_POPUP_ENABLED_KEY_BG]: true,
+ [BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY_BG]: true
+ }, (res) => {
+ callback({
+ popupEnabled: res[BRIDGE_NOTIFY_POPUP_ENABLED_KEY_BG] !== false,
+ attentionEnabled: res[BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY_BG] !== false
+ });
+ });
+}
+
+function drawBridgeNotificationAttention(tab) {
+ if (!tab || !tab.windowId || !chrome.windows || !chrome.windows.update) return;
+
+ try {
+ chrome.windows.update(tab.windowId, { drawAttention: true }, () => {
+ void chrome.runtime.lastError;
+ });
+ } catch (e) {}
+}
+
+function focusBridgeNotificationTab(notificationId) {
+ if (!notificationId || notificationId.indexOf(BRIDGE_NOTIFICATION_PREFIX) !== 0) return;
+
+ const rest = notificationId.slice(BRIDGE_NOTIFICATION_PREFIX.length);
+ const tabIdText = rest.split('-')[0];
+ const tabId = Number(tabIdText);
+
+ if (!Number.isFinite(tabId) || !chrome.tabs || !chrome.tabs.get) return;
+
+ chrome.tabs.get(tabId, (tab) => {
+ if (chrome.runtime.lastError || !tab) return;
+
+ if (chrome.windows && chrome.windows.update && tab.windowId) {
+ chrome.windows.update(tab.windowId, { focused: true, drawAttention: false }, () => {
+ void chrome.runtime.lastError;
+ });
+ }
+
+ chrome.tabs.update(tabId, { active: true }, () => {
+ void chrome.runtime.lastError;
+ });
+ });
+
+ if (chrome.notifications && chrome.notifications.clear) {
+ chrome.notifications.clear(notificationId, () => {
+ void chrome.runtime.lastError;
+ });
+ }
+}
+
+function createBridgeNotification(tab, payload, sendResponse) {
+ getBridgeNotifySettings((settings) => {
+ if (settings.attentionEnabled) {
+ drawBridgeNotificationAttention(tab);
+ }
+
+ if (!settings.popupEnabled) {
+ sendResponse({ ok: true, popup: 'disabled', attention: settings.attentionEnabled });
+ return;
+ }
+
+ if (!chrome.notifications || !chrome.notifications.create) {
+ sendResponse({ ok: false, error: 'notifications_unavailable', attention: settings.attentionEnabled });
+ return;
+ }
+
+ const tabId = tab && tab.id ? tab.id : 0;
+ const type = payload && payload.type ? String(payload.type) : 'complete';
+ const notificationId = BRIDGE_NOTIFICATION_PREFIX + tabId + '-' + type + '-' + Date.now();
+
+ chrome.notifications.create(notificationId, {
+ type: 'basic',
+ iconUrl: getBridgeNotificationIconUrl(),
+ title: payload && payload.title ? payload.title : '작업 완료',
+ message: payload && payload.message ? payload.message : '새 작업 상태가 도착했습니다.',
+ priority: 2
+ }, () => {
+ const err = chrome.runtime.lastError;
+ if (err) {
+ sendResponse({ ok: false, error: err.message, attention: settings.attentionEnabled });
+ return;
+ }
+
+ sendResponse({ ok: true, notificationId, attention: settings.attentionEnabled });
+ });
+ });
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+ if (!msg || msg.action !== 'bridgeNotifyComplete') return false;
+
+ createBridgeNotification(sender && sender.tab ? sender.tab : null, msg, sendResponse);
+ return true;
+});
+
+if (chrome.notifications && chrome.notifications.onClicked) {
+ chrome.notifications.onClicked.addListener((notificationId) => {
+ focusBridgeNotificationTab(notificationId);
+ });
+}

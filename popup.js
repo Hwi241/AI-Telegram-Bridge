@@ -132,3 +132,59 @@ document.addEventListener('DOMContentLoaded', function() {
 
   refreshBtn.addEventListener('click', requestBalanceRefresh);
 });
+// ────────────────────────────────────────
+// AI/TG 완료 알림 설정
+// ────────────────────────────────────────
+const BRIDGE_NOTIFY_POPUP_ENABLED_KEY = 'bridge_notify_popup_enabled';
+const BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY = 'bridge_notify_attention_enabled';
+
+function setBridgeCompleteNotifyStatus() {
+ const status = document.getElementById('bridge-complete-notify-status');
+ const popupToggle = document.getElementById('bridge-notify-popup-toggle');
+ const attentionToggle = document.getElementById('bridge-notify-attention-toggle');
+
+ if (!status || !popupToggle || !attentionToggle) return;
+
+ const popupText = popupToggle.checked ? '팝업 ON' : '팝업 OFF';
+ const attentionText = attentionToggle.checked ? '깜빡임 ON' : '깜빡임 OFF';
+
+ status.textContent = popupText + ' / ' + attentionText + ' · AI 완료 / Telegram 도착 모두 적용';
+}
+
+function initBridgeCompleteNotifyToggles() {
+ const popupToggle = document.getElementById('bridge-notify-popup-toggle');
+ const attentionToggle = document.getElementById('bridge-notify-attention-toggle');
+
+ if (!popupToggle || !attentionToggle) return;
+ if (popupToggle.dataset.bridgeNotifyReady === 'true') return;
+
+ popupToggle.dataset.bridgeNotifyReady = 'true';
+ attentionToggle.dataset.bridgeNotifyReady = 'true';
+
+ chrome.storage.local.get({
+ [BRIDGE_NOTIFY_POPUP_ENABLED_KEY]: true,
+ [BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY]: true
+ }, (res) => {
+ popupToggle.checked = res[BRIDGE_NOTIFY_POPUP_ENABLED_KEY] !== false;
+ attentionToggle.checked = res[BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY] !== false;
+ setBridgeCompleteNotifyStatus();
+ });
+
+ popupToggle.addEventListener('change', () => {
+ chrome.storage.local.set({
+ [BRIDGE_NOTIFY_POPUP_ENABLED_KEY]: !!popupToggle.checked
+ }, setBridgeCompleteNotifyStatus);
+ });
+
+ attentionToggle.addEventListener('change', () => {
+ chrome.storage.local.set({
+ [BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY]: !!attentionToggle.checked
+ }, setBridgeCompleteNotifyStatus);
+ });
+}
+
+if (document.readyState === 'loading') {
+ document.addEventListener('DOMContentLoaded', initBridgeCompleteNotifyToggles);
+} else {
+ initBridgeCompleteNotifyToggles();
+}
