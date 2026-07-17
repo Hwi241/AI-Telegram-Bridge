@@ -20,7 +20,13 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "AI ↔ Telegram Bridge"
+    "default_title": "AI ↔ Telegram Bridge",
+    "default_icon": {
+      "16": "icon16.png",
+      "32": "icon32.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
   },
   "background": {
     "service_worker": "background.js"
@@ -39,5 +45,11 @@
       ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
 }

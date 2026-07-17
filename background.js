@@ -452,7 +452,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ────────────────────────────────────────
-// AI 완료 / Telegram 도착 알림
+// AI 응답 완료 알림
 // ────────────────────────────────────────
 const BRIDGE_NOTIFY_POPUP_ENABLED_KEY_BG = 'bridge_notify_popup_enabled';
 const BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY_BG = 'bridge_notify_attention_enabled';
@@ -469,7 +469,7 @@ function getBridgeNotificationIconUrl() {
  }
  } catch (e) {}
 
- return chrome.runtime.getURL('bridge-notification-icon.svg');
+ return chrome.runtime.getURL('bridge-notification-icon.png');
 }
 
 function getBridgeNotifySettings(callback) {
@@ -564,6 +564,12 @@ function createBridgeNotification(tab, payload, sendResponse) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
  if (!msg || msg.action !== 'bridgeNotifyComplete') return false;
+
+ // Telegram은 자체 알림을 사용하고 확장프로그램 알림에서는 제외한다.
+ if (msg.type !== 'ai') {
+ sendResponse({ ok: true, ignored: 'non_ai_notification' });
+ return false;
+ }
 
  createBridgeNotification(sender && sender.tab ? sender.tab : null, msg, sendResponse);
  return true;

@@ -133,7 +133,7 @@ document.addEventListener('DOMContentLoaded', function() {
   refreshBtn.addEventListener('click', requestBalanceRefresh);
 });
 // ────────────────────────────────────────
-// AI/TG 완료 알림 설정
+// AI 응답 완료 알림 설정
 // ────────────────────────────────────────
 const BRIDGE_NOTIFY_POPUP_ENABLED_KEY = 'bridge_notify_popup_enabled';
 const BRIDGE_NOTIFY_ATTENTION_ENABLED_KEY = 'bridge_notify_attention_enabled';
@@ -148,7 +148,7 @@ function setBridgeCompleteNotifyStatus() {
  const popupText = popupToggle.checked ? '팝업 ON' : '팝업 OFF';
  const attentionText = attentionToggle.checked ? '깜빡임 ON' : '깜빡임 OFF';
 
- status.textContent = popupText + ' / ' + attentionText + ' · AI 완료 / Telegram 도착 모두 적용';
+ status.textContent = popupText + ' / ' + attentionText + ' · AI 응답 완료에만 적용';
 }
 
 function initBridgeCompleteNotifyToggles() {
