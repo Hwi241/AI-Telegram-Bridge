@@ -478,7 +478,341 @@ function telegram_getMessageForMode(mode) {
   return telegram_getLastBotMessage();
 }
 
-const TELEGRAM_SEND_BUTTON_SELECTOR = 'button.btn-send, ' + 'button.bubbles-corner-button:not(.chat-secondary-button), ' + 'button[aria-label*="Send"], ' + 'button[aria-label*="보내"]';function telegram_isVisibleElement(el) { if (!el || !el.isConnected) { return false; } if (el.closest('[hidden], [aria-hidden="true"], [inert]')) { return false; } const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || style.pointerEvents === 'none') { return false; } const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) { return false; } return (rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth);}function telegram_getVisibleComposerInputs() { return Array.from(document.querySelectorAll('div.input-message-input[contenteditable="true"]')).filter(telegram_isVisibleElement);}function telegram_getVisibleButtonsInScope(scope) { if (!scope || !scope.querySelectorAll) { return []; } return Array.from(scope.querySelectorAll(TELEGRAM_SEND_BUTTON_SELECTOR)).filter(telegram_isVisibleElement);}function telegram_findComposerScope(input) { if (!input || !input.isConnected) { return null; } let node = input.parentElement; while (node && node !== document.body) { if (telegram_getVisibleButtonsInScope(node).length > 0) { return node; } node = node.parentElement; } return (input.closest('main') || input.parentElement || document.body);}function telegram_getNearestSendButton(scope, input) { const buttons = telegram_getVisibleButtonsInScope(scope); if (!buttons.length) { return null; } if (!input) { return buttons[0]; } const inputRect = input.getBoundingClientRect(); const inputX = inputRect.left + inputRect.width / 2; const inputY = inputRect.top + inputRect.height / 2; return buttons.map(function(button) { const rect = button.getBoundingClientRect(); const buttonX = rect.left + rect.width / 2; const buttonY = rect.top + rect.height / 2; return { button: button, distance: Math.abs(buttonX - inputX) + Math.abs(buttonY - inputY) }; }).sort(function(a, b) { return a.distance - b.distance; })[0].button;}function telegram_getComposerInput() { const candidates = telegram_getVisibleComposerInputs(); if (!candidates.length) { return null; } const activeElement = document.activeElement; if (activeElement && candidates.includes(activeElement)) { return activeElement; } const pairedCandidates = candidates.filter(function(input) { const scope = telegram_findComposerScope(input); return !!telegram_getNearestSendButton(scope, input); }); const source = pairedCandidates.length ? pairedCandidates : candidates; return source.map(function(input) { const rect = input.getBoundingClientRect(); const scope = telegram_findComposerScope(input); const button = telegram_getNearestSendButton(scope, input); return { input: input, hasButton: !!button, bottom: rect.bottom, area: rect.width * rect.height }; }).sort(function(a, b) { if (a.hasButton !== b.hasButton) { return a.hasButton ? -1 : 1; } if (a.bottom !== b.bottom) { return b.bottom - a.bottom; } return b.area - a.area; })[0].input;}function telegram_getSendButton(scope, input) { return telegram_getNearestSendButton(scope, input);}function telegram_createTransferContext() { const input = telegram_getComposerInput(); if (!input) { return null; } const scope = telegram_findComposerScope(input); if (!scope) { return null; } return { href: location.href, input: input, scope: scope };}function telegram_isTransferContextCurrent(transferContext) { if (!transferContext || location.href !== transferContext.href || !transferContext.input || !transferContext.input.isConnected || !transferContext.scope || !transferContext.scope.isConnected || !telegram_isVisibleElement(transferContext.input)) { return false; } const currentInput = telegram_getComposerInput(); return (currentInput === transferContext.input);}function telegram_getTransferSendButton(transferContext) { if (!telegram_isTransferContextCurrent(transferContext)) { return null; } return telegram_getSendButton(transferContext.scope, transferContext.input);}function telegram_normalizeComposerText(text) { return normalizeBridgeText(text).replace(/\u00a0/g, ' ').replace(/\u200b/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n+$/g, '');}function telegram_readComposerText(input) { if (!input) return ''; return telegram_normalizeComposerText(typeof input.innerText === 'string' ? input.innerText : '');}function telegram_composerMatches(input, expectedText) { if (!input || !input.isConnected) { return false; } return (telegram_readComposerText(input) === expectedText);}function telegram_getTransferComposer(transferContext) { if (!telegram_isTransferContextCurrent(transferContext)) { return null; } return transferContext.input;}async function telegram_waitForComposerMatch(transferContext, expectedText, timeoutMs) { const deadline = Date.now() + timeoutMs; let stableMatches = 0; while (Date.now() < deadline) { const input = telegram_getTransferComposer(transferContext); if (!input) { return { ok: false, changedChat: location.href !== startHref, input: null }; } if (telegram_composerMatches(input, expectedText)) { stableMatches += 1; if (stableMatches >= 2) { return { ok: true, changedChat: false, input: input }; } } else { stableMatches = 0; } await sleep(250); } return { ok: false, changedChat: !telegram_isTransferContextCurrent(transferContext), input: telegram_getTransferComposer(transferContext) };}async function telegram_clearComposer(input) { if (!input || !input.isConnected) { return false; } input.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null })); await sleep(120); return (telegram_readComposerText(input) === '');}async function telegram_insertByPaste(input, text) { if (!input || !input.isConnected) { return false; } input.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); await sleep(80); return dispatchPasteText(input, text);}async function telegram_insertByTextFallback(input, text) { if (!input || !input.isConnected) { return false; } const cleared = await telegram_clearComposer(input); if (!cleared) { return false; } input.focus(); const inserted = document.execCommand('insertText', false, text); input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text })); return !!inserted;}async function telegram_waitForSendButton(transferContext, expectedText, timeoutMs) { const deadline = Date.now() + timeoutMs; while (Date.now() < deadline) { if (!telegram_isTransferContextCurrent(transferContext)) { return { ok: false, changedChat: true, button: null }; } const input = telegram_getTransferComposer(transferContext); if (!telegram_composerMatches(input, expectedText)) { return { ok: false, changedChat: false, button: null }; } const button = telegram_getTransferSendButton(transferContext); if (button && button.isConnected && telegram_isVisibleElement(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true') { return { ok: true, changedChat: false, button: button }; } await sleep(250); } return { ok: false, changedChat: !telegram_isTransferContextCurrent(transferContext), button: null };}async function telegram_waitForSendCompletion(transferContext, expectedText, timeoutMs) { const deadline = Date.now() + timeoutMs; while (Date.now() < deadline) { if (!telegram_isTransferContextCurrent(transferContext)) { return { ok: false, changedChat: true, uncertain: true }; } const input = telegram_getTransferComposer(transferContext); if (input && telegram_readComposerText(input) === '') { return { ok: true, changedChat: false, uncertain: false }; } if (input && !telegram_composerMatches(input, expectedText)) { const current = telegram_readComposerText(input); if (!current) { return { ok: true, changedChat: false, uncertain: false }; } return { ok: false, changedChat: false, uncertain: true }; } await sleep(250); } return { ok: false, changedChat: !telegram_isTransferContextCurrent(transferContext), uncertain: true };}async function telegram_sendMessage(text, autoSend) { if (telegram_sendMessage.__busy) { return { ok: false, error: 'Telegram 전송이 이미 진행 중이에요.' }; } telegram_sendMessage.__busy = true; try { const normalizedText = telegram_normalizeComposerText(text); if (!normalizedText) { return { ok: false, error: '전송할 내용이 없어요.' }; } const transferContext = telegram_createTransferContext(); let input = transferContext ? transferContext.input : null; if (!input) { return { ok: false, error: 'Telegram 입력창을 찾을 수 없어요.' }; } await telegram_insertByPaste(input, normalizedText); let pasteResult = await telegram_waitForComposerMatch(transferContext, normalizedText, 5000); if (pasteResult.changedChat) { return { ok: false, error: '전송 중 Telegram 채팅이 변경되어 중단했습니다.' }; } if (!pasteResult.ok) { input = telegram_getTransferComposer(transferContext); if (!input) { return { ok: false, error: 'Telegram 입력창이 변경되어 중단했습니다.' }; } await telegram_insertByTextFallback(input, normalizedText); pasteResult = await telegram_waitForComposerMatch(transferContext, normalizedText, 8000); } if (pasteResult.changedChat) { return { ok: false, error: '전송 중 Telegram 채팅이 변경되어 중단했습니다.' }; } if (!pasteResult.ok) { return { ok: false, error: '긴 내용 입력을 확인하지 못했습니다. Telegram 입력창을 확인해주세요.' }; } if (!autoSend) { return { ok: true, pasted: true, sent: false }; } const buttonResult = await telegram_waitForSendButton(transferContext, normalizedText, 8000); if (buttonResult.changedChat) { return { ok: false, error: '전송 직전 Telegram 채팅이 변경되어 자동 전송을 중단했습니다.' }; } if (!buttonResult.ok) { return { ok: false, error: '내용은 입력했지만 전송 버튼이 활성화되지 않았습니다. 직접 전송해주세요.' }; } const finalInput = telegram_getTransferComposer(transferContext); if (!telegram_composerMatches(finalInput, normalizedText)) { return { ok: false, error: '전송 직전 입력 내용이 변경되어 자동 전송을 중단했습니다.' }; } const button = buttonResult.button; if (!button || !button.isConnected || button.disabled || button.getAttribute('aria-disabled') === 'true') { return { ok: false, error: '전송 버튼 상태가 변경되었습니다. 직접 전송해주세요.' }; } button.click(); const completion = await telegram_waitForSendCompletion(transferContext, normalizedText, 10000); if (completion.ok) { return { ok: true, pasted: true, sent: true }; } if (completion.changedChat) { return { ok: false, error: '전송 버튼은 한 번 클릭했지만 채팅이 변경되어 결과를 확인할 수 없습니다.' }; } return { ok: false, error: '전송 버튼은 한 번 클릭했지만 완료를 확인하지 못했습니다. 중복 방지를 위해 다시 전송하지 않았습니다.' }; } finally { telegram_sendMessage.__busy = false; }}
+const TELEGRAM_SEND_BUTTON_SELECTOR = 'button.btn-send, ' + 'button.bubbles-corner-button:not(.chat-secondary-button), ' + 'button[aria-label*="Send"], ' + 'button[aria-label*="보내"]';function telegram_isVisibleElement(el) { if (!el || !el.isConnected) { return false; } if (el.closest('[hidden], [aria-hidden="true"], [inert]')) { return false; } const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || style.pointerEvents === 'none') { return false; } const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) { return false; } return (rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth);}function telegram_getVisibleComposerInputs() { return Array.from(document.querySelectorAll('div.input-message-input[contenteditable="true"]')).filter(telegram_isVisibleElement);}function telegram_getVisibleButtonsInScope(scope) { if (!scope || !scope.querySelectorAll) { return []; } return Array.from(scope.querySelectorAll(TELEGRAM_SEND_BUTTON_SELECTOR)).filter(telegram_isVisibleElement);}function telegram_findComposerScope(input) { if (!input || !input.isConnected) { return null; } let node = input.parentElement; while (node && node !== document.body) { if (telegram_getVisibleButtonsInScope(node).length > 0) { return node; } node = node.parentElement; } return (input.closest('main') || input.parentElement || document.body);}function telegram_getNearestSendButton(scope, input) { const buttons = telegram_getVisibleButtonsInScope(scope); if (!buttons.length) { return null; } if (!input) { return buttons[0]; } const inputRect = input.getBoundingClientRect(); const inputX = inputRect.left + inputRect.width / 2; const inputY = inputRect.top + inputRect.height / 2; return buttons.map(function(button) { const rect = button.getBoundingClientRect(); const buttonX = rect.left + rect.width / 2; const buttonY = rect.top + rect.height / 2; return { button: button, distance: Math.abs(buttonX - inputX) + Math.abs(buttonY - inputY) }; }).sort(function(a, b) { return a.distance - b.distance; })[0].button;}function telegram_getComposerInput() { const candidates = telegram_getVisibleComposerInputs(); if (!candidates.length) { return null; } const activeElement = document.activeElement; if (activeElement && candidates.includes(activeElement)) { return activeElement; } const pairedCandidates = candidates.filter(function(input) { const scope = telegram_findComposerScope(input); return !!telegram_getNearestSendButton(scope, input); }); const source = pairedCandidates.length ? pairedCandidates : candidates; return source.map(function(input) { const rect = input.getBoundingClientRect(); const scope = telegram_findComposerScope(input); const button = telegram_getNearestSendButton(scope, input); return { input: input, hasButton: !!button, bottom: rect.bottom, area: rect.width * rect.height }; }).sort(function(a, b) { if (a.hasButton !== b.hasButton) { return a.hasButton ? -1 : 1; } if (a.bottom !== b.bottom) { return b.bottom - a.bottom; } return b.area - a.area; })[0].input;}function telegram_getSendButton(scope, input) { return telegram_getNearestSendButton(scope, input);}function telegram_getCurrentChatKey() {
+ return (
+ String(location.pathname || '') +
+ String(location.hash || '')
+ );
+}
+
+function telegram_createTransferContext() {
+ const chatKey =
+ telegram_getCurrentChatKey();
+
+ if (!location.hash || !chatKey) {
+ return null;
+ }
+
+ const input =
+ telegram_getComposerInput();
+
+ if (!input) {
+ return null;
+ }
+
+ const scope =
+ telegram_findComposerScope(input);
+
+ if (!scope) {
+ return null;
+ }
+
+ return {
+ chatKey: chatKey,
+ input: input,
+ scope: scope
+ };
+}
+
+function telegram_isTransferChatCurrent(
+ transferContext
+) {
+ if (
+ !transferContext ||
+ !transferContext.chatKey
+ ) {
+ return false;
+ }
+
+ return (
+ telegram_getCurrentChatKey() ===
+ transferContext.chatKey
+ );
+}
+
+function telegram_refreshTransferContext(
+ transferContext
+) {
+ if (
+ !telegram_isTransferChatCurrent(
+ transferContext
+ )
+ ) {
+ return null;
+ }
+
+ const currentInput =
+ telegram_getComposerInput();
+
+ if (!currentInput) {
+ return null;
+ }
+
+ const currentScope =
+ telegram_findComposerScope(
+ currentInput
+ );
+
+ if (!currentScope) {
+ return null;
+ }
+
+ transferContext.input =
+ currentInput;
+
+ transferContext.scope =
+ currentScope;
+
+ return currentInput;
+}
+
+function telegram_isTransferContextCurrent(
+ transferContext
+) {
+ return !!telegram_refreshTransferContext(
+ transferContext
+ );
+}
+
+function telegram_getTransferSendButton(
+ transferContext
+) {
+ const input =
+ telegram_refreshTransferContext(
+ transferContext
+ );
+
+ if (!input) {
+ return null;
+ }
+
+ return telegram_getSendButton(
+ transferContext.scope,
+ input
+ );
+}
+
+function telegram_normalizeComposerText(text) { return normalizeBridgeText(text).replace(/\u00a0/g, ' ').replace(/\u200b/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n+$/g, '');}function telegram_readComposerText(input) { if (!input) return ''; return telegram_normalizeComposerText(typeof input.innerText === 'string' ? input.innerText : '');}function telegram_composerMatches(input, expectedText) { if (!input || !input.isConnected) { return false; } return (telegram_readComposerText(input) === expectedText);}function telegram_getTransferComposer(
+ transferContext
+) {
+ return telegram_refreshTransferContext(
+ transferContext
+ );
+}
+
+async function telegram_waitForComposerMatch(
+ transferContext,
+ expectedText,
+ timeoutMs
+) {
+ const deadline =
+ Date.now() + timeoutMs;
+
+ while (Date.now() < deadline) {
+ if (
+ !telegram_isTransferChatCurrent(
+ transferContext
+ )
+ ) {
+ return {
+ ok: false,
+ changedChat: true,
+ input: null
+ };
+ }
+
+ const input =
+ telegram_getTransferComposer(
+ transferContext
+ );
+
+ if (
+ input &&
+ telegram_composerMatches(
+ input,
+ expectedText
+ )
+ ) {
+ return {
+ ok: true,
+ changedChat: false,
+ input: input
+ };
+ }
+
+ await sleep(250);
+ }
+
+ return {
+ ok: false,
+ changedChat:
+ !telegram_isTransferChatCurrent(
+ transferContext
+ ),
+ input:
+ telegram_getTransferComposer(
+ transferContext
+ )
+ };
+}
+
+async function telegram_clearComposer(input) { if (!input || !input.isConnected) { return false; } input.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null })); await sleep(120); return (telegram_readComposerText(input) === '');}async function telegram_insertByPaste(input, text) { if (!input || !input.isConnected) { return false; } input.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); await sleep(80); return dispatchPasteText(input, text);}async function telegram_insertByTextFallback(input, text) { if (!input || !input.isConnected) { return false; } const cleared = await telegram_clearComposer(input); if (!cleared) { return false; } input.focus(); const inserted = document.execCommand('insertText', false, text); input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text })); return !!inserted;}async function telegram_waitForSendButton(
+ transferContext,
+ expectedText,
+ timeoutMs
+) {
+ const deadline =
+ Date.now() + timeoutMs;
+
+ while (Date.now() < deadline) {
+ if (
+ !telegram_isTransferChatCurrent(
+ transferContext
+ )
+ ) {
+ return {
+ ok: false,
+ changedChat: true,
+ button: null
+ };
+ }
+
+ const input =
+ telegram_getTransferComposer(
+ transferContext
+ );
+
+ if (!input) {
+ await sleep(250);
+ continue;
+ }
+
+ if (
+ !telegram_composerMatches(
+ input,
+ expectedText
+ )
+ ) {
+ return {
+ ok: false,
+ changedChat: false,
+ button: null
+ };
+ }
+
+ const button =
+ telegram_getTransferSendButton(
+ transferContext
+ );
+
+ if (
+ button &&
+ button.isConnected &&
+ telegram_isVisibleElement(button) &&
+ !button.disabled &&
+ button.getAttribute(
+ 'aria-disabled'
+ ) !== 'true'
+ ) {
+ return {
+ ok: true,
+ changedChat: false,
+ button: button
+ };
+ }
+
+ await sleep(250);
+ }
+
+ return {
+ ok: false,
+ changedChat:
+ !telegram_isTransferChatCurrent(
+ transferContext
+ ),
+ button: null
+ };
+}
+
+async function telegram_waitForSendCompletion(
+ transferContext,
+ expectedText,
+ timeoutMs
+) {
+ const deadline =
+ Date.now() + timeoutMs;
+
+ while (Date.now() < deadline) {
+ if (
+ !telegram_isTransferChatCurrent(
+ transferContext
+ )
+ ) {
+ return {
+ ok: false,
+ changedChat: true,
+ uncertain: true
+ };
+ }
+
+ const input =
+ telegram_getTransferComposer(
+ transferContext
+ );
+
+ if (!input) {
+ await sleep(250);
+ continue;
+ }
+
+ if (
+ telegram_readComposerText(input) === ''
+ ) {
+ return {
+ ok: true,
+ changedChat: false,
+ uncertain: false
+ };
+ }
+
+ if (
+ !telegram_composerMatches(
+ input,
+ expectedText
+ )
+ ) {
+ const current =
+ telegram_readComposerText(input);
+
+ if (!current) {
+ return {
+ ok: true,
+ changedChat: false,
+ uncertain: false
+ };
+ }
+
+ return {
+ ok: false,
+ changedChat: false,
+ uncertain: true
+ };
+ }
+
+ await sleep(250);
+ }
+
+ return {
+ ok: false,
+ changedChat:
+ !telegram_isTransferChatCurrent(
+ transferContext
+ ),
+ uncertain: true
+ };
+}
+
+async function telegram_sendMessage(text, autoSend) { if (telegram_sendMessage.__busy) { return { ok: false, error: 'Telegram 전송이 이미 진행 중이에요.' }; } telegram_sendMessage.__busy = true; try { const normalizedText = telegram_normalizeComposerText(text); if (!normalizedText) { return { ok: false, error: '전송할 내용이 없어요.' }; } const transferContext = telegram_createTransferContext(); let input = transferContext ? transferContext.input : null; if (!input) { return { ok: false, error: 'Telegram 입력창을 찾을 수 없어요.' }; } await telegram_insertByPaste(input, normalizedText); let pasteResult = await telegram_waitForComposerMatch(transferContext, normalizedText, 5000); if (pasteResult.changedChat) { return { ok: false, error: '전송 중 Telegram 채팅이 변경되어 중단했습니다.' }; } if (!pasteResult.ok) { input = telegram_getTransferComposer(transferContext); if (!input) { return { ok: false, error: 'Telegram 입력창이 변경되어 중단했습니다.' }; } await telegram_insertByTextFallback(input, normalizedText); pasteResult = await telegram_waitForComposerMatch(transferContext, normalizedText, 8000); } if (pasteResult.changedChat) { return { ok: false, error: '전송 중 Telegram 채팅이 변경되어 중단했습니다.' }; } if (!pasteResult.ok) { return { ok: false, error: '긴 내용 입력을 확인하지 못했습니다. Telegram 입력창을 확인해주세요.' }; } if (!autoSend) { return { ok: true, pasted: true, sent: false }; } const buttonResult = await telegram_waitForSendButton(transferContext, normalizedText, 8000); if (buttonResult.changedChat) { return { ok: false, error: '전송 직전 Telegram 채팅이 변경되어 자동 전송을 중단했습니다.' }; } if (!buttonResult.ok) { return { ok: false, error: '내용은 입력했지만 전송 버튼이 활성화되지 않았습니다. 직접 전송해주세요.' }; } const finalInput = telegram_getTransferComposer(transferContext); if (!telegram_composerMatches(finalInput, normalizedText)) { return { ok: false, error: '전송 직전 입력 내용이 변경되어 자동 전송을 중단했습니다.' }; } const button = buttonResult.button; if (!button || !button.isConnected || button.disabled || button.getAttribute('aria-disabled') === 'true') { return { ok: false, error: '전송 버튼 상태가 변경되었습니다. 직접 전송해주세요.' }; } button.click(); const completion = await telegram_waitForSendCompletion(transferContext, normalizedText, 10000); if (completion.ok) { return { ok: true, pasted: true, sent: true }; } if (completion.changedChat) { return { ok: false, error: '전송 버튼은 한 번 클릭했지만 채팅이 변경되어 결과를 확인할 수 없습니다.' }; } return { ok: false, error: '전송 버튼은 한 번 클릭했지만 완료를 확인하지 못했습니다. 중복 방지를 위해 다시 전송하지 않았습니다.' }; } finally { telegram_sendMessage.__busy = false; }}
 
 // ────────────────────────────────────────
 // 사이트별 디스패처
