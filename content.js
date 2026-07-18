@@ -176,10 +176,124 @@ function chatgpt_getResponse() {
   return last.innerText?.trim() || null;
 }
 
+function chatgpt_isVisible(el) {
+ if (!el) return false;
+
+ const style = window.getComputedStyle(el);
+
+ if (
+ style.display === 'none' ||
+ style.visibility === 'hidden' ||
+ Number(style.opacity) === 0
+ ) {
+ return false;
+ }
+
+ const rect = el.getBoundingClientRect();
+ return rect.width > 0 && rect.height > 0;
+}
+
+function chatgpt_hasVisibleSearchInLatestTurn() {
+ const assistantMessages = Array.from(
+ document.querySelectorAll(
+ '[data-message-author-role="assistant"]'
+ )
+ );
+
+ if (!assistantMessages.length) return false;
+
+ const latestAssistant =
+ assistantMessages[assistantMessages.length - 1];
+
+ const latestTurn =
+ latestAssistant.closest(
+ '[data-testid^="conversation-turn-"]'
+ ) ||
+ latestAssistant.closest('article') ||
+ latestAssistant.parentElement;
+
+ if (!latestTurn) return false;
+
+ const candidates = Array.from(
+ latestTurn.querySelectorAll(
+ '[role="status"], span, div, p'
+ )
+ );
+
+ return candidates.slice(-120).some(function(el) {
+ if (!chatgpt_isVisible(el)) return false;
+
+ const text = String(
+ el.innerText || el.textContent || ''
+ )
+ .replace(/\s+/g, ' ')
+ .trim();
+
+ if (!text || text.length > 80) return false;
+
+ return (
+ text === '검색 중' ||
+ text === '웹 검색 중' ||
+ text.startsWith('검색 중 ') ||
+ text.startsWith('웹 검색 중 ')
+ );
+ });
+}
+
+function chatgpt_hasActiveWorkIndicator() {
+ if (chatgpt_hasVisibleSearchInLatestTurn()) {
+ return true;
+ }
+
+ const activeControls = Array.from(document.querySelectorAll(
+ 'button[data-testid*="stop"], ' +
+ 'button[aria-label*="Stop"], ' +
+ 'button[aria-label*="stop"], ' +
+ 'button[aria-label*="중지"], ' +
+ '[aria-busy="true"], ' +
+ '[role="progressbar"]'
+ ));
+
+ if (activeControls.some(chatgpt_isVisible)) {
+ return true;
+ }
+
+ const statusElements = Array.from(document.querySelectorAll(
+ '[role="status"], ' +
+ '[data-testid*="search"], ' +
+ '[data-testid*="thinking"], ' +
+ '[data-testid*="tool"]'
+ ));
+
+ const activeTextPatterns = [
+ /^(웹\s*)?검색\s*중/i,
+ /^자료를\s*찾는\s*중/i,
+ /^생각\s*중/i,
+ /^분석\s*중/i,
+ /^searching(?:\s+the\s+web)?/i,
+ /^browsing/i,
+ /^thinking/i,
+ /^analyzing/i,
+ /^reading/i
+ ];
+
+ return statusElements.slice(-30).some(function(el) {
+ if (!chatgpt_isVisible(el)) return false;
+
+ const text = String(el.innerText || el.textContent || '')
+ .replace(/\s+/g, ' ')
+ .trim();
+
+ if (!text || text.length > 120) return false;
+
+ return activeTextPatterns.some(function(pattern) {
+ return pattern.test(text);
+ });
+ });
+}
+
 function chatgpt_isStreaming() {
-  return !!document.querySelector(
-    'button[aria-label="Stop streaming"], [data-testid="stop-button"], button[aria-label="Stop generating"]'
-  );
+ return chatgpt_hasActiveWorkIndicator();
 }
 
 async function chatgpt_pasteInput(text, autoSend) {
@@ -1166,6 +1280,8 @@ function injectAIWidget() {
   var _streaming = false;
   var _prevStreaming = null;
   var _streamingCheckBusy = false;
+  var _streamingFalseSince = 0;
+  const STREAMING_COMPLETE_STABLE_MS = 3000;
 
   function applyStreamingPanelState(streaming) {
     _streaming = streaming;
@@ -1182,16 +1298,33 @@ function injectAIWidget() {
   }
 
   function updateStreamingState(streaming) {
-    // GPT 작성 중 감지는 기존 로직을 그대로 사용하고 완료 알림만 연결한다.
-    const bridgeAiNotifyNextStreaming = !!streaming;
-    const bridgeAiNotifyWasStreaming =
-      updateStreamingState.__bridgeAiNotifyWasStreaming === true;
+    const rawStreaming = !!streaming;
+    const now = Date.now();
 
-    updateStreamingState.__bridgeAiNotifyWasStreaming =
-      bridgeAiNotifyNextStreaming;
-    updateStreamingState.__bridgeAiNotifyConnected = true;
+    if (rawStreaming) {
+      _streamingFalseSince = 0;
+    } else if (_prevStreaming === true) {
+      if (!_streamingFalseSince) {
+        _streamingFalseSince = now;
+        return;
+      }
 
-    if (bridgeAiNotifyWasStreaming && !bridgeAiNotifyNextStreaming) {
+      if (now - _streamingFalseSince < STREAMING_COMPLETE_STABLE_MS) {
+        return;
+      }
+    } else {
+      _streamingFalseSince = 0;
+    }
+
+    const nextStreaming = rawStreaming;
+    const wasStreaming = _prevStreaming === true;
+
+    if (nextStreaming === _prevStreaming) return;
+
+    _prevStreaming = nextStreaming;
+    applyStreamingPanelState(nextStreaming);
+
+    if (wasStreaming && !nextStreaming) {
       const bridgeAiNotifyHost = String(location.hostname || '');
       const bridgeAiNotifyIsAiPage =
         bridgeAiNotifyHost === 'chatgpt.com' ||
@@ -1224,10 +1357,6 @@ function injectAIWidget() {
         }, 350);
       }
     }
-
-    if (streaming === _prevStreaming) return;
-    _prevStreaming = streaming;
-    applyStreamingPanelState(streaming);
   }
 
   function checkStreaming() {
@@ -1259,14 +1388,12 @@ function injectAIWidget() {
 
         if (runtimeError) {
           console.log('[AI-STREAM-REMOTE-ERR]', runtimeError.message);
-          updateStreamingState(false);
           return;
         }
 
         console.log('[AI-STREAM-REMOTE-RES]', res);
 
         if (!res || !res.ok) {
-          updateStreamingState(false);
           return;
         }
 
@@ -1275,7 +1402,6 @@ function injectAIWidget() {
     } catch (e) {
       console.log('[AI-STREAM-REMOTE-THROW]', e && e.message ? e.message : e);
       _streamingCheckBusy = false;
-      updateStreamingState(false);
     }
   }
 
