@@ -362,25 +362,508 @@ function chatgpt_isStreaming() {
  return false;
 }
 
-async function chatgpt_pasteInput(text, autoSend) {
-  const input = document.querySelector('#prompt-textarea') ||
-                document.querySelector('div[contenteditable="true"][data-lexical-editor]') ||
-                document.querySelector('div[contenteditable="true"]');
-  if (!input) return { ok: false, error: '입력창을 찾을 수 없어요.' };
-  setInput(input, text);
-  if (!autoSend) return { ok: true };
-  await sleep(400);
-  const btn = document.querySelector(
-    'button[data-testid="send-button"], button[aria-label="Send message"], button[aria-label="메시지 보내기"]'
-  );
-  if (!btn || btn.disabled) return { ok: false, error: '전송 버튼을 찾을 수 없어요.' };
-  btn.click();
-  return { ok: true };
-}
+const CHATGPT_SEND_BUTTON_SELECTOR =
+ 'button[data-testid="send-button"], ' +
+ 'button[aria-label="Send message"], ' +
+ 'button[aria-label="메시지 보내기"]';
 
 function chatgpt_getInputEl() {
-  return document.querySelector('#prompt-textarea') ||
-         document.querySelector('div[contenteditable="true"]');
+ const candidates = [
+ document.querySelector('#prompt-textarea'),
+ document.querySelector(
+ 'div[contenteditable="true"]' +
+ '[data-lexical-editor]'
+ ),
+ document.querySelector(
+ 'form div[contenteditable="true"]'
+ )
+ ];
+
+ return (
+ candidates.find(function(input) {
+ return (
+ input &&
+ input.isConnected &&
+ chatgpt_isVisible(input)
+ );
+ }) ||
+ null
+ );
+}
+
+function chatgpt_getComposerObserverScope(input) {
+ if (!input || !input.isConnected) {
+ return null;
+ }
+ const form = input.closest('form');
+ if (form && form.parentElement) {
+ return form.parentElement;
+ }
+ return form || input.parentElement || null;
+}
+
+function chatgpt_getReadySendButton(input) {
+ const form = input && input.closest('form');
+ const roots = form ? [form, document] : [document];
+
+ for (const root of roots) {
+ const buttons = Array.from(
+ root.querySelectorAll(CHATGPT_SEND_BUTTON_SELECTOR)
+ );
+
+ const readyButton = buttons.find(function(button) {
+ return (
+ button &&
+ button.isConnected &&
+ chatgpt_isVisible(button) &&
+ !button.disabled &&
+ button.getAttribute('aria-disabled') !== 'true'
+ );
+ });
+
+ if (readyButton) {
+ return readyButton;
+ }
+ }
+
+ return null;
+}
+
+function chatgpt_normalizeComposerText(text) {
+ return normalizeBridgeText(text)
+ .replace(/\u00a0/g, ' ')
+ .replace(/\u200b/g, '')
+ .replace(/[ \t]+\n/g, '\n')
+ .replace(/\n+$/g, '');
+}
+
+function chatgpt_composerMatches(input, expectedText) {
+ if (!input || !input.isConnected) {
+ return false;
+ }
+
+ const currentText =
+ chatgpt_normalizeComposerText(
+ getContentEditablePlainText(input)
+ );
+
+ return (
+ currentText.length === expectedText.length &&
+ currentText === expectedText
+ );
+}
+
+function chatgpt_pasteOnce(
+ input,
+ expectedText
+) {
+ if (!input || !input.isConnected) {
+ return false;
+ }
+
+ input.focus();
+
+ document.execCommand(
+ 'selectAll',
+ false,
+ null
+ );
+
+ return dispatchPasteText(
+ input,
+ expectedText
+ );
+}
+
+function chatgpt_getComparableText(
+ text
+) {
+ return normalizeBridgeText(text)
+ .replace(/\u00a0/g, ' ')
+ .replace(/\u200b/g, '')
+ .replace(/\s+/g, ' ')
+ .trim();
+}
+
+function chatgpt_getTransferAnchors(
+ expectedText
+) {
+ const comparable =
+ chatgpt_getComparableText(
+ expectedText
+ );
+
+ const anchorSize =
+ Math.min(
+ 96,
+ comparable.length
+ );
+
+ const middleStart =
+ Math.max(
+ 0,
+ Math.floor(
+ (
+ comparable.length -
+ anchorSize
+ ) / 2
+ )
+ );
+
+ return {
+ comparable: comparable,
+ start:
+ comparable.slice(
+ 0,
+ anchorSize
+ ),
+ middle:
+ comparable.slice(
+ middleStart,
+ middleStart +
+ anchorSize
+ ),
+ end:
+ comparable.slice(
+ -anchorSize
+ )
+ };
+}
+
+function chatgpt_composerLooksComplete(
+ input,
+ anchors
+) {
+ if (
+ !input ||
+ !input.isConnected ||
+ !anchors ||
+ !anchors.comparable
+ ) {
+ return false;
+ }
+
+ const rawText =
+ getContentEditablePlainText(
+ input
+ );
+
+ const comparable =
+ chatgpt_getComparableText(
+ rawText
+ );
+
+ const minimumLength =
+ Math.floor(
+ anchors.comparable.length *
+ 0.92
+ );
+
+ if (
+ comparable.length <
+ minimumLength
+ ) {
+ return false;
+ }
+
+ return (
+ comparable.startsWith(
+ anchors.start
+ ) &&
+ comparable.includes(
+ anchors.middle
+ ) &&
+ comparable.endsWith(
+ anchors.end
+ )
+ );
+}
+
+function chatgpt_waitForReadyAndSend(
+ expectedText,
+ timeoutMs
+) {
+ return new Promise(function(resolve) {
+ const anchors =
+ chatgpt_getTransferAnchors(
+ expectedText
+ );
+
+ let finished = false;
+ let scopeObserver = null;
+ let inputObserver = null;
+ let timer = null;
+ let observedScope = null;
+ let observedInput = null;
+ let checkQueued = false;
+ let lastRawLength = -1;
+
+ const cleanup = function() {
+ if (scopeObserver) {
+ scopeObserver.disconnect();
+ }
+
+ if (inputObserver) {
+ inputObserver.disconnect();
+ }
+
+ if (timer) {
+ clearTimeout(timer);
+ }
+ };
+
+ const finish = function(result) {
+ if (finished) {
+ return;
+ }
+
+ finished = true;
+ cleanup();
+ resolve(result);
+ };
+
+ const requestCheck = function() {
+ if (
+ finished ||
+ checkQueued
+ ) {
+ return;
+ }
+
+ checkQueued = true;
+
+ queueMicrotask(function() {
+ checkQueued = false;
+ check();
+ });
+ };
+
+ const observeScope = function(scope) {
+ if (
+ !scope ||
+ !scope.isConnected ||
+ scope === observedScope
+ ) {
+ return;
+ }
+
+ if (scopeObserver) {
+ scopeObserver.disconnect();
+ }
+
+ observedScope = scope;
+
+ scopeObserver.observe(
+ observedScope,
+ {
+ subtree: true,
+ childList: true,
+ attributes: true,
+ attributeFilter: [
+ 'disabled',
+ 'aria-disabled',
+ 'hidden'
+ ]
+ }
+ );
+ };
+
+ const observeInput = function(input) {
+ if (
+ !input ||
+ !input.isConnected ||
+ input === observedInput
+ ) {
+ return;
+ }
+
+ if (inputObserver) {
+ inputObserver.disconnect();
+ }
+
+ observedInput = input;
+ lastRawLength = -1;
+
+ inputObserver.observe(
+ observedInput,
+ {
+ subtree: true,
+ childList: true,
+ characterData: true
+ }
+ );
+ };
+
+ const check = function() {
+ if (finished) {
+ return;
+ }
+
+ const input =
+ chatgpt_getInputEl();
+
+ if (!input) {
+ return;
+ }
+
+ observeInput(input);
+
+ observeScope(
+ chatgpt_getComposerObserverScope(
+ input
+ )
+ );
+
+ const button =
+ chatgpt_getReadySendButton(
+ input
+ );
+
+ if (!button) {
+ return;
+ }
+
+ const rawLength =
+ (
+ input.textContent ||
+ ''
+ ).length;
+
+ if (
+ rawLength ===
+ lastRawLength
+ ) {
+ return;
+ }
+
+ lastRawLength = rawLength;
+
+ if (
+ !chatgpt_composerLooksComplete(
+ input,
+ anchors
+ )
+ ) {
+ return;
+ }
+
+ finished = true;
+ cleanup();
+
+ button.click();
+
+ resolve({
+ ok: true,
+ pasted: true,
+ sent: true
+ });
+ };
+
+ scopeObserver =
+ new MutationObserver(
+ requestCheck
+ );
+
+ inputObserver =
+ new MutationObserver(
+ requestCheck
+ );
+
+ const initialInput =
+ chatgpt_getInputEl();
+
+ if (initialInput) {
+ observeInput(initialInput);
+
+ observeScope(
+ chatgpt_getComposerObserverScope(
+ initialInput
+ )
+ );
+ }
+
+ timer = setTimeout(function() {
+ finish({
+ ok: false,
+ error:
+ 'ChatGPT 입력이 끝까지 완료되지 않아 자동 전송하지 않았어요.'
+ });
+ }, timeoutMs);
+
+ requestCheck();
+ });
+}
+
+async function chatgpt_pasteInput(
+ text,
+ autoSend
+) {
+ if (chatgpt_pasteInput.__busy) {
+ return {
+ ok: false,
+ error:
+ 'ChatGPT 전송이 이미 진행 중이에요.'
+ };
+ }
+
+ chatgpt_pasteInput.__busy = true;
+
+ try {
+ const input =
+ chatgpt_getInputEl();
+
+ if (!input) {
+ return {
+ ok: false,
+ error:
+ 'ChatGPT 입력창을 찾을 수 없어요.'
+ };
+ }
+
+ const expectedText =
+ chatgpt_normalizeComposerText(
+ text
+ );
+
+ if (!expectedText) {
+ return {
+ ok: false,
+ error:
+ '전송할 내용이 없어요.'
+ };
+ }
+
+ const pasted =
+ chatgpt_pasteOnce(
+ input,
+ expectedText
+ );
+
+ if (!pasted) {
+ return {
+ ok: false,
+ error:
+ 'ChatGPT 입력창에 붙여넣지 못했어요.'
+ };
+ }
+
+ if (!autoSend) {
+ return {
+ ok: true,
+ pasted: true,
+ sent: false
+ };
+ }
+
+ return await
+ chatgpt_waitForReadyAndSend(
+ expectedText,
+ 15000
+ );
+ } finally {
+ chatgpt_pasteInput.__busy =
+ false;
+ }
 }
 
 // ────────────────────────────────────────
@@ -430,20 +913,718 @@ function gemini_getInputEl() {
 // ────────────────────────────────────────
 // Telegram
 // ────────────────────────────────────────
+const telegramAnswerBatchCache = {
+ chatKey: '',
+ boundaryKey: '',
+ boundaryOrder: null,
+ messages: [],
+ messageIndexByKey: new Map(),
+ nextSequence: 1,
+ root: null,
+ observer: null,
+ ensureTimer: null,
+ captureQueued: false
+};
+
+function telegram_cacheIsOutgoingBubble(
+ bubble
+) {
+ if (!bubble) {
+ return false;
+ }
+
+ if (
+ typeof telegram_isOutgoingBubble ===
+ 'function'
+ ) {
+ return telegram_isOutgoingBubble(
+ bubble
+ );
+ }
+
+ return (
+ bubble.classList.contains('is-out') ||
+ !!bubble.closest('.is-out')
+ );
+}
+
+function telegram_cacheIsVisibleBubble(
+ bubble
+) {
+ if (
+ !bubble ||
+ !bubble.isConnected
+ ) {
+ return false;
+ }
+
+ const style =
+ window.getComputedStyle(bubble);
+
+ if (
+ style.display === 'none' ||
+ style.visibility === 'hidden'
+ ) {
+ return false;
+ }
+
+ return (
+ bubble.getClientRects().length > 0
+ );
+}
+
+function telegram_cacheBubbleText(
+ bubble
+) {
+ if (!bubble) {
+ return '';
+ }
+
+ const rawText =
+ typeof bubble.innerText === 'string'
+ ? bubble.innerText
+ : bubble.textContent || '';
+
+ return normalizeBridgeText(rawText)
+ .replace(/\u00a0/g, ' ')
+ .replace(/\u200b/g, '')
+ .trim();
+}
+
+function telegram_cacheHashText(
+ text
+) {
+ let hash = 2166136261;
+
+ for (
+ let index = 0;
+ index < text.length;
+ index += 1
+ ) {
+ hash ^= text.charCodeAt(index);
+
+ hash = Math.imul(
+ hash,
+ 16777619
+ );
+ }
+
+ return (
+ hash >>> 0
+ ).toString(36);
+}
+
+function telegram_cacheNumericOrder(
+ value
+) {
+ if (
+ value === null ||
+ typeof value === 'undefined'
+ ) {
+ return null;
+ }
+
+ const matches =
+ String(value).match(/\d+/g);
+
+ if (!matches || !matches.length) {
+ return null;
+ }
+
+ const numericValue =
+ Number(
+ matches[matches.length - 1]
+ );
+
+ return Number.isSafeInteger(
+ numericValue
+ )
+ ? numericValue
+ : null;
+}
+
+function telegram_cacheTimeInfo(
+ bubble
+) {
+ if (!bubble) {
+ return {
+ raw: '',
+ order: null
+ };
+ }
+
+ const timeElement =
+ bubble.querySelector(
+ 'time, [data-timestamp], .time'
+ );
+
+ if (!timeElement) {
+ return {
+ raw: '',
+ order: null
+ };
+ }
+
+ const raw =
+ timeElement.getAttribute(
+ 'datetime'
+ ) ||
+ timeElement.getAttribute(
+ 'data-timestamp'
+ ) ||
+ timeElement.textContent ||
+ '';
+
+ let order =
+ telegram_cacheNumericOrder(raw);
+
+ if (order === null) {
+ const parsed = Date.parse(raw);
+
+ if (Number.isFinite(parsed)) {
+ order = parsed;
+ }
+ }
+
+ return {
+ raw: String(raw).trim(),
+ order: order
+ };
+}
+
+function telegram_cacheBubbleDescriptor(
+ bubble,
+ direction
+) {
+ if (!bubble) {
+ return {
+ key: '',
+ order: null,
+ text: ''
+ };
+ }
+
+ const attributeNames = [
+ 'data-mid',
+ 'data-message-id',
+ 'data-msg-id',
+ 'data-id'
+ ];
+
+ const text =telegram_cacheBubbleText(
+ bubble
+ );
+
+ for (const name of attributeNames) {
+ const value =
+ bubble.getAttribute(name);
+
+ if (!value) {
+ continue;
+ }
+
+ return {
+ key:
+ direction +
+ ':' +
+ name +
+ ':' +
+ value,
+ order:
+ telegram_cacheNumericOrder(
+ value
+ ),
+ text: text
+ };
+ }
+
+ if (bubble.id) {
+ return {
+ key:
+ direction +
+ ':id:' +
+ bubble.id,
+ order:
+ telegram_cacheNumericOrder(
+ bubble.id
+ ),
+ text: text
+ };
+ }
+
+ const timeInfo =
+ telegram_cacheTimeInfo(
+ bubble
+ );
+
+ if (timeInfo.raw) {
+ return {
+ key:
+ direction +
+ ':time:' +
+ timeInfo.raw +
+ ':' +
+ telegram_cacheHashText(
+ text.slice(0, 96)
+ ),
+ order: timeInfo.order,
+ text: text
+ };
+ }
+
+ return {
+ key:
+ direction +
+ ':text:' +
+ telegram_cacheHashText(
+ text.slice(0, 160)
+ ),
+ order: null,
+ text: text
+ };
+}
+
+function telegram_findMessageRoot() {
+ const visibleBubbles =
+ Array.from(
+ document.querySelectorAll(
+ '.bubble'
+ )
+ ).filter(
+ telegram_cacheIsVisibleBubble
+ );
+
+ const anchorBubble =
+ visibleBubbles[
+ visibleBubbles.length - 1
+ ] ||
+ document.querySelector('.bubble');
+
+ if (!anchorBubble) {
+ return null;
+ }
+
+ return (
+ anchorBubble.closest(
+ '.bubbles-inner'
+ ) ||
+ anchorBubble.closest(
+ '.bubbles'
+ ) ||
+ anchorBubble.parentElement ||
+ null
+ );
+}
+
+function telegram_cacheRootIsNearBottom(
+ root
+) {
+ if (!root) {
+ return false;
+ }
+
+ let scrollElement = root;
+
+ while (
+ scrollElement &&
+ scrollElement !== document.body
+ ) {
+ if (
+ scrollElement.scrollHeight >
+ scrollElement.clientHeight + 40
+ ) {
+ break;
+ }
+
+ scrollElement =
+ scrollElement.parentElement;
+ }
+
+ if (
+ !scrollElement ||
+ scrollElement === document.body
+ ) {
+ return true;
+ }
+
+ const remaining =
+ scrollElement.scrollHeight -
+ scrollElement.scrollTop -
+ scrollElement.clientHeight;
+
+ return remaining < 240;
+}
+
+function telegram_resetAnswerBatchCache(
+ chatKey,
+ boundaryDescriptor
+) {
+ telegramAnswerBatchCache.chatKey =
+ chatKey || '';
+
+ telegramAnswerBatchCache.boundaryKey =
+ boundaryDescriptor
+ ? boundaryDescriptor.key
+ : '';
+
+ telegramAnswerBatchCache.boundaryOrder =
+ boundaryDescriptor
+ ? boundaryDescriptor.order
+ : null;
+
+ telegramAnswerBatchCache.messages = [];
+
+ telegramAnswerBatchCache
+ .messageIndexByKey
+ .clear();
+
+ telegramAnswerBatchCache.nextSequence =
+ 1;
+}
+
+function telegram_shouldResetForBoundary(
+ descriptor,
+ lastOutgoingIndex,
+ bubbleCount,
+ root
+) {
+ if (
+ !descriptor ||
+ !descriptor.key
+ ) {
+ return false;
+ }
+
+ if (
+ !telegramAnswerBatchCache
+ .boundaryKey
+ ) {
+ return true;
+ }
+
+ if (
+ descriptor.key ===
+ telegramAnswerBatchCache
+ .boundaryKey
+ ) {
+ return false;
+ }
+
+ const currentOrder =
+ telegramAnswerBatchCache
+ .boundaryOrder;
+
+ if (
+ typeof descriptor.order ===
+ 'number' &&
+ typeof currentOrder ===
+ 'number'
+ ) {
+ return (
+ descriptor.order >
+ currentOrder
+ );
+ }
+
+ const outgoingNearEnd =
+ lastOutgoingIndex >=
+ bubbleCount - 2;
+
+ return (
+ outgoingNearEnd &&
+ telegram_cacheRootIsNearBottom(
+ root
+ )
+ );
+}
+
+function telegram_rebuildMessageIndex() {
+ telegramAnswerBatchCache
+ .messageIndexByKey
+ .clear();
+
+ telegramAnswerBatchCache
+ .messages
+ .forEach(function(message, index) {
+ telegramAnswerBatchCache
+ .messageIndexByKey
+ .set(
+ message.key,
+ index
+ );
+ });
+}
+
+function telegram_sortCachedMessages() {
+ telegramAnswerBatchCache
+ .messages
+ .sort(function(a, b) {
+ if (
+ typeof a.order === 'number' &&
+ typeof b.order === 'number' &&
+ a.order !== b.order
+ ) {
+ return a.order -b.order;
+ }
+
+ return a.sequence - b.sequence;
+ });
+
+ telegram_rebuildMessageIndex();
+}
+
+function telegram_storeCachedMessage(
+ descriptor
+) {
+ if (
+ !descriptor ||
+ !descriptor.key ||
+ !descriptor.text
+ ) {
+ return;
+ }
+
+ const existingIndex =
+ telegramAnswerBatchCache
+ .messageIndexByKey
+ .get(descriptor.key);
+
+ if (
+ typeof existingIndex ===
+ 'number'
+ ) {
+ const existing =
+ telegramAnswerBatchCache
+ .messages[existingIndex];
+
+ existing.text = descriptor.text;
+
+ if (
+ typeof descriptor.order ===
+ 'number'
+ ) {
+ existing.order =
+ descriptor.order;
+ }
+
+ return;
+ }
+
+ telegramAnswerBatchCache
+ .messages
+ .push({
+ key: descriptor.key,
+ order: descriptor.order,
+ sequence:
+ telegramAnswerBatchCache
+ .nextSequence,
+ text: descriptor.text
+ });
+
+ telegramAnswerBatchCache
+ .nextSequence += 1;
+
+ telegram_sortCachedMessages();
+}
+
+function telegram_captureAnswerBatch() {
+ const chatKey =
+ telegram_getCurrentChatKey();
+
+ if (!chatKey) {
+ return;
+ }
+
+ const root =
+ telegram_findMessageRoot();
+
+ if (!root) {
+ return;
+ }
+
+ const bubbles =
+ Array.from(
+ root.querySelectorAll(
+ '.bubble'
+ )
+ );
+
+ if (!bubbles.length) {
+ return;
+ }
+
+ let lastOutgoingIndex = -1;
+ let latestBoundary = null;
+
+ for (
+ let index = 0;
+ index < bubbles.length;
+ index += 1
+ ) {
+ const bubble = bubbles[index];
+
+ if (
+ !telegram_cacheIsOutgoingBubble(
+ bubble
+ )
+ ) {
+ continue;
+ }
+
+ lastOutgoingIndex = index;
+
+ latestBoundary =
+ telegram_cacheBubbleDescriptor(
+ bubble,
+ 'out'
+ );
+ }
+
+ const chatChanged =
+ telegramAnswerBatchCache.chatKey !==
+ chatKey;
+
+ if (chatChanged) {
+ telegram_resetAnswerBatchCache(
+ chatKey,
+ latestBoundary
+ );
+ } else if (
+ telegram_shouldResetForBoundary(
+ latestBoundary,
+ lastOutgoingIndex,
+ bubbles.length,
+ root
+ )
+ ) {
+ telegram_resetAnswerBatchCache(
+ chatKey,
+ latestBoundary
+ );
+ } else if (
+ !telegramAnswerBatchCache.chatKey
+ ) {
+ telegramAnswerBatchCache.chatKey =
+ chatKey;
+ }
+
+ for (
+ let index = lastOutgoingIndex + 1;
+ index < bubbles.length;
+ index += 1
+ ) {
+ const bubble = bubbles[index];
+
+ if (
+ telegram_cacheIsOutgoingBubble(
+ bubble
+ )
+ ) {
+ continue;
+ }
+
+ const descriptor =
+ telegram_cacheBubbleDescriptor(
+ bubble,
+ 'in'
+ );
+
+ telegram_storeCachedMessage(
+ descriptor
+ );
+ }
+}
+
+function telegram_queueAnswerBatchCapture() {
+ if (
+ telegramAnswerBatchCache.captureQueued
+ ) {
+ return;
+ }
+
+ telegramAnswerBatchCache.captureQueued =
+ true;
+
+ queueMicrotask(function() {
+ telegramAnswerBatchCache.captureQueued =
+ false;
+
+ telegram_captureAnswerBatch();
+ });
+}
+
+function telegram_ensureAnswerBatchObserver() {
+ const root =
+ telegram_findMessageRoot();
+
+ if (!root) {
+ return;
+ }
+
+ if (
+ telegramAnswerBatchCache.root ===
+ root &&
+ telegramAnswerBatchCache.observer
+ ) {
+ telegram_captureAnswerBatch();
+ return;
+ }
+
+ if (
+ telegramAnswerBatchCache.observer
+ ) {
+ telegramAnswerBatchCache
+ .observer
+ .disconnect();
+ }
+
+ telegramAnswerBatchCache.root = root;
+
+ telegramAnswerBatchCache.observer =
+ new MutationObserver(
+ telegram_queueAnswerBatchCapture
+ );
+
+ telegramAnswerBatchCache
+ .observer
+ .observe(
+ root,
+ {
+ subtree: true,
+ childList: true,
+ characterData: true
+ }
+ );
+
+ telegram_captureAnswerBatch();
+}
+
 function telegram_getAllLastBotMessages() {
-  // ── K 버전: .bubble ──
-  const bubbles = document.querySelectorAll('.bubble');
-  if (bubbles.length) {
-    const texts = [];
-    for (let i = bubbles.length - 1; i >= 0; i--) {
-      const bubble = bubbles[i];
-      if (bubble.classList.contains('is-out')) break; // 사용자 메시지 → 중단
-      const text = bubble.querySelector('.text, .message, [class*="text-content"]')?.innerText?.trim();
-      if (text) texts.unshift(text);
-    }
-    if (texts.length) return texts.join('\n\n');
-  }
-  return null;
+ telegram_ensureAnswerBatchObserver();
+ telegram_captureAnswerBatch();
+
+ return telegramAnswerBatchCache
+ .messages
+ .map(function(message) {
+ return message.text;
+ })
+ .filter(Boolean)
+ .join('\n\n');
+}
+
+if (
+ location.hostname ===
+ 'web.telegram.org' ||
+ location.hostname.endsWith('.telegram.org'
+ )
+) {
+ telegram_ensureAnswerBatchObserver();
+
+ telegramAnswerBatchCache.ensureTimer =
+ setInterval(
+ telegram_ensureAnswerBatchObserver,
+ 1000
+ );
 }
 
 function telegram_getLastBotMessage() {
