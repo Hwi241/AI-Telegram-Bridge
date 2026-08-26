@@ -1773,7 +1773,160 @@ function telegram_getTransferSendButton(
  );
 }
 
-function telegram_normalizeComposerText(text) { return normalizeBridgeText(text).replace(/\u00a0/g, ' ').replace(/\u200b/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n+$/g, '');}function telegram_readComposerText(input) { if (!input) return ''; return telegram_normalizeComposerText(typeof input.innerText === 'string' ? input.innerText : '');}function telegram_composerMatches(input, expectedText) { if (!input || !input.isConnected) { return false; } return (telegram_readComposerText(input) === expectedText);}function telegram_getTransferComposer(
+function telegram_normalizeComposerText(text) {
+ return normalizeBridgeText(text)
+ .replace(/\u00a0/g, ' ')
+ .replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '')
+ .replace(/[ \t]+\n/g, '\n')
+ .replace(/\n+$/g, '');
+}
+
+function telegram_readComposerText(input) {
+ if (!input) {
+  return '';
+ }
+
+ return telegram_normalizeComposerText(
+  typeof input.innerText === 'string'
+  ? input.innerText
+  : ''
+ );
+}
+
+function telegram_getComparableTransferText(
+ text
+) {
+ return normalizeBridgeText(text)
+ .replace(/\u00a0/g, ' ')
+ .replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '')
+ .replace(/\s+/g, ' ')
+ .trim();
+}
+
+function telegram_readComparableTransferText(
+ input
+) {
+ if (!input) {
+  return '';
+ }
+
+ const rawText =
+  typeof input.innerText === 'string'
+  ? input.innerText
+  : (
+   typeof input.textContent === 'string'
+   ? input.textContent
+   : ''
+  );
+
+ return telegram_getComparableTransferText(
+  rawText
+ );
+}
+
+function telegram_getTransferAnchors(
+ expectedText
+) {
+ const comparable =
+  telegram_getComparableTransferText(
+   expectedText
+  );
+
+ const anchorSize =
+  Math.min(
+   96,
+   comparable.length
+  );
+
+ const middleStart =
+  Math.max(
+   0,
+   Math.floor(
+    (
+     comparable.length -
+     anchorSize
+    ) / 2
+   )
+  );
+
+ return {
+  comparable: comparable,
+  start:
+   comparable.slice(
+    0,
+    anchorSize
+   ),
+  middle:
+   comparable.slice(
+    middleStart,
+    middleStart +
+    anchorSize
+   ),
+  end:
+   comparable.slice(
+    -anchorSize
+   )
+ };
+}
+
+function telegram_composerMatches(
+ input,
+ expectedText
+) {
+ if (
+  !input ||
+  !input.isConnected
+ ) {
+  return false;
+ }
+
+ const anchors =
+  telegram_getTransferAnchors(
+   expectedText
+  );
+
+ if (
+  !anchors.comparable
+ ) {
+  return false;
+ }
+
+ const currentComparable =
+  telegram_readComparableTransferText(
+   input
+  );
+
+ if (!currentComparable) {
+  return false;
+ }
+
+ const minimumLength =
+  Math.floor(
+   anchors.comparable.length *
+   0.90
+  );
+
+ if (
+  currentComparable.length <
+  minimumLength
+ ) {
+  return false;
+ }
+
+ return (
+  currentComparable.startsWith(
+   anchors.start
+  ) &&
+  currentComparable.includes(
+   anchors.middle
+  ) &&
+  currentComparable.endsWith(
+   anchors.end
+  )
+ );
+}
+
+function telegram_getTransferComposer(
  transferContext
 ) {
  return telegram_refreshTransferContext(
@@ -1993,7 +2146,189 @@ async function telegram_waitForSendCompletion(
  };
 }
 
-async function telegram_sendMessage(text, autoSend) { if (telegram_sendMessage.__busy) { return { ok: false, error: 'Telegram 전송이 이미 진행 중이에요.' }; } telegram_sendMessage.__busy = true; try { const normalizedText = telegram_normalizeComposerText(text); if (!normalizedText) { return { ok: false, error: '전송할 내용이 없어요.' }; } const transferContext = telegram_createTransferContext(); let input = transferContext ? transferContext.input : null; if (!input) { return { ok: false, error: 'Telegram 입력창을 찾을 수 없어요.' }; } await telegram_insertByPaste(input, normalizedText); let pasteResult = await telegram_waitForComposerMatch(transferContext, normalizedText, 5000); if (pasteResult.changedChat) { return { ok: false, error: '전송 중 Telegram 채팅이 변경되어 중단했습니다.' }; } if (!pasteResult.ok) { input = telegram_getTransferComposer(transferContext); if (!input) { return { ok: false, error: 'Telegram 입력창이 변경되어 중단했습니다.' }; } await telegram_insertByTextFallback(input, normalizedText); pasteResult = await telegram_waitForComposerMatch(transferContext, normalizedText, 8000); } if (pasteResult.changedChat) { return { ok: false, error: '전송 중 Telegram 채팅이 변경되어 중단했습니다.' }; } if (!pasteResult.ok) { return { ok: false, error: '긴 내용 입력을 확인하지 못했습니다. Telegram 입력창을 확인해주세요.' }; } if (!autoSend) { return { ok: true, pasted: true, sent: false }; } const buttonResult = await telegram_waitForSendButton(transferContext, normalizedText, 8000); if (buttonResult.changedChat) { return { ok: false, error: '전송 직전 Telegram 채팅이 변경되어 자동 전송을 중단했습니다.' }; } if (!buttonResult.ok) { return { ok: false, error: '내용은 입력했지만 전송 버튼이 활성화되지 않았습니다. 직접 전송해주세요.' }; } const finalInput = telegram_getTransferComposer(transferContext); if (!telegram_composerMatches(finalInput, normalizedText)) { return { ok: false, error: '전송 직전 입력 내용이 변경되어 자동 전송을 중단했습니다.' }; } const button = buttonResult.button; if (!button || !button.isConnected || button.disabled || button.getAttribute('aria-disabled') === 'true') { return { ok: false, error: '전송 버튼 상태가 변경되었습니다. 직접 전송해주세요.' }; } button.click(); const completion = await telegram_waitForSendCompletion(transferContext, normalizedText, 10000); if (completion.ok) { return { ok: true, pasted: true, sent: true }; } if (completion.changedChat) { return { ok: false, error: '전송 버튼은 한 번 클릭했지만 채팅이 변경되어 결과를 확인할 수 없습니다.' }; } return { ok: false, error: '전송 버튼은 한 번 클릭했지만 완료를 확인하지 못했습니다. 중복 방지를 위해 다시 전송하지 않았습니다.' }; } finally { telegram_sendMessage.__busy = false; }}
+async function telegram_sendMessage(
+ text,
+ autoSend
+) {
+ if (telegram_sendMessage.__busy) {
+ return {
+ ok: false,
+ error:
+ 'Telegram 전송이 이미 진행 중이에요.'
+ };
+ }
+
+ telegram_sendMessage.__busy = true;
+
+ try {
+ const normalizedText =
+ telegram_normalizeComposerText(
+ text
+ );
+
+ if (!normalizedText) {
+ return {
+ ok: false,
+ error:
+ '전송할 내용이 없어요.'
+ };
+ }
+
+ const transferContext =
+ telegram_createTransferContext();
+
+ const input =
+ transferContext
+ ? transferContext.input
+ : null;
+
+ if (!input) {
+ return {
+ ok: false,
+ error:
+ 'Telegram 입력창을 찾을 수 없어요.'
+ };
+ }
+
+ const pasted =
+ await telegram_insertByPaste(
+ input,
+ normalizedText
+ );
+
+ if (!pasted) {
+ return {
+ ok: false,
+ error:
+ 'Telegram 입력창에 코드를 붙여넣지 못했습니다.'
+ };
+ }
+
+ const pasteResult =
+ await telegram_waitForComposerMatch(
+ transferContext,
+ normalizedText,
+ 12000
+ );
+
+ if (pasteResult.changedChat) {
+ return {
+ ok: false,
+ error:
+ '전송 중 Telegram 채팅이 변경되어 중단했습니다.'
+ };
+ }
+
+ if (!pasteResult.ok) {
+ return {
+ ok: false,
+ error:
+ '긴 코드 입력 완료를 확인하지 못했습니다. 처음 붙여넣은 내용은 지우지 않았습니다.'
+ };
+ }
+
+ if (!autoSend) {
+ return {
+ ok: true,
+ pasted: true,
+ sent: false
+ };
+ }
+
+ const buttonResult =
+ await telegram_waitForSendButton(
+ transferContext,
+ normalizedText,
+ 8000
+ );
+
+ if (buttonResult.changedChat) {
+ return {
+ ok: false,
+ error:
+ '전송 직전 Telegram 채팅이 변경되어 자동 전송을 중단했습니다.'
+ };
+ }
+
+ if (!buttonResult.ok) {
+ return {
+ ok: false,
+ error:
+ '코드는 입력됐지만 Telegram 전송 버튼이 활성화되지 않았습니다. 직접 전송해주세요.'
+ };
+ }
+
+ const finalInput =
+ telegram_getTransferComposer(
+ transferContext
+ );
+
+ if (
+ !telegram_composerMatches(
+ finalInput,
+ normalizedText
+ )
+ ) {
+ return {
+ ok: false,
+ error:
+ '전송 직전 Telegram 코드 입력 상태가 변경되어 자동 전송을 중단했습니다.'
+ };
+ }
+
+ const button =
+ buttonResult.button;
+
+ if (
+ !button ||
+ !button.isConnected ||
+ button.disabled ||
+ button.getAttribute(
+ 'aria-disabled'
+ ) === 'true'
+ ) {
+ return {
+ ok: false,
+ error:
+ 'Telegram 전송 버튼 상태가 변경되었습니다. 직접 전송해주세요.'
+ };
+ }
+
+ button.click();
+
+ const completion =
+ await telegram_waitForSendCompletion(
+ transferContext,
+ normalizedText,
+ 10000
+ );
+
+ if (completion.ok) {
+ return {
+ ok: true,
+ pasted: true,
+ sent: true
+ };
+ }
+
+ if (completion.changedChat) {
+ return {
+ ok: false,
+ error:
+ '전송 버튼은 한 번 클릭했지만 채팅이 변경되어 결과를 확인할 수 없습니다.'
+ };
+ }
+
+ return {
+ ok: false,
+ error:
+ '전송 버튼은 한 번 클릭했지만 완료를 확인하지 못했습니다. 중복 방지를 위해 다시 전송하지 않았습니다.'
+ };
+ } finally {
+ telegram_sendMessage.__busy =
+ false;
+ }
+}
 
 // ────────────────────────────────────────
 // 사이트별 디스패처
