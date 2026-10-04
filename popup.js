@@ -100,6 +100,11 @@ document.addEventListener('DOMContentLoaded', function() {
   const saveBtn = $('save-deepseek-key');
   const clearBtn = $('clear-deepseek-key');
   const refreshBtn = $('refresh-deepseek-balance');
+  const showFloatingPanelsBtn =
+    $('bridge-show-floating-panels');
+
+  const showFloatingPanelsStatus =
+    $('bridge-show-floating-panels-status');
 
   refreshPopupState();
 
@@ -131,6 +136,31 @@ document.addEventListener('DOMContentLoaded', function() {
   });
 
   refreshBtn.addEventListener('click', requestBalanceRefresh);
+
+  if (showFloatingPanelsBtn) {
+    showFloatingPanelsBtn.addEventListener(
+      'click',
+      function() {
+        chrome.storage.local.set(
+          {
+            widgetUiState_ai:
+              'normal',
+            widgetUiState_tg:
+              'normal'
+          },
+          function() {
+            if (
+              showFloatingPanelsStatus
+            ) {
+              showFloatingPanelsStatus
+                .textContent =
+                '플로팅 패널 표시 상태로 복원됨';
+            }
+          }
+        );
+      }
+    );
+  }
 });
 // ────────────────────────────────────────
 // AI 응답 완료 알림 설정

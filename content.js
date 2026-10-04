@@ -6,6 +6,12 @@ window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__ = true;
 
 // content.js v5.0
 // Claude, ChatGPT, Gemini, Telegram 범용 지원
+const CTB_RUNTIME_BUILD = '058-15';
+
+console.log(
+  '[CTB] content runtime ' +
+  CTB_RUNTIME_BUILD
+);
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -167,13 +173,684 @@ function claude_getInputEl() {
 // ────────────────────────────────────────
 // ChatGPT
 // ────────────────────────────────────────
+const CHATGPT_ROLLOUT_ASSISTANT_SELECTOR =
+  '[data-chatgpt-search-unit-key$=":assistant"]' +
+  '[data-chatgpt-search-message-ids]';
+
+const CHATGPT_ROLLOUT_ASSISTANT_MARKER_SELECTOR =
+  '[data-conversation-role="assistant"], ' +
+  '[data-chatgpt-agent-turn-start]';
+
+function chatgpt_readCodeNodeText(node) {
+  if (!node) {
+    return '';
+  }
+
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.nodeValue || '';
+  }
+
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    return '';
+  }
+
+  if (node.tagName === 'BR') {
+    return '\n';
+  }
+
+  if (
+    node.matches?.(
+      '[data-markdown-copy="exclude"]'
+    )
+  ) {
+    return '';
+  }
+
+  return Array.from(node.childNodes)
+    .map(chatgpt_readCodeNodeText)
+    .join('');
+}
+
+function chatgpt_extractRolloutCode(widget) {
+  if (!widget) {
+    return '';
+  }
+
+  const editor =
+    widget.querySelector(
+      '[role="textbox"][aria-label="Edit code"]'
+    ) ||
+    widget.querySelector(
+      '[role="textbox"][data-language]'
+    ) ||
+    widget.querySelector(
+      '[contenteditable="true"][data-language]'
+    );
+
+  if (editor) {
+    const lines =
+      Array.from(
+        editor.querySelectorAll('.cm-line')
+      );
+
+    if (lines.length) {
+      return lines
+        .map(function(line) {
+          return line.textContent || '';
+        })
+        .join('\n')
+        .replace(/\u00a0/g, ' ')
+        .replace(/\u200b/g, '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/\n+$/g, '');
+    }
+
+    const editorText =
+      editor.textContent || '';
+
+    if (editorText.trim()) {
+      return editorText
+        .replace(/\u00a0/g, ' ')
+        .replace(/\u200b/g, '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/\n+$/g, '');
+    }
+  }
+
+  const code =
+    Array.from(
+      widget.querySelectorAll(
+        'pre code, code'
+      )
+    ).find(function(node) {
+      return !node.closest?.(
+        '[data-markdown-copy="exclude"]'
+      );
+    });
+
+  if (code) {
+    return chatgpt_readCodeNodeText(code)
+      .replace(/\u00a0/g, ' ')
+      .replace(/\u200b/g, '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\n+$/g, '');
+  }
+
+  return '';
+}
+
+function chatgpt_extractCodeText(root) {
+  if (!root) {
+    return '';
+  }
+
+  if (
+    root.matches?.(
+      '[data-markdown-copy="code-block"]'
+    )
+  ) {
+    const rolloutText =
+      chatgpt_extractRolloutCode(root);
+
+    if (rolloutText.trim()) {
+      return rolloutText;
+    }
+  }
+
+  const source =
+    root.querySelector?.(
+      'pre.cm-content code, ' +
+      '.cm-content code, ' +
+      'pre code, ' +
+      'code'
+    ) ||
+    (
+      root.matches?.('.cm-content')
+        ? root
+        : root.querySelector?.(
+            '.cm-content'
+          )
+    ) ||
+    root;
+
+  return chatgpt_readCodeNodeText(source)
+    .replace(/\u00a0/g, ' ')
+    .replace(/\u200b/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n+$/g, '');
+}
+
+function chatgpt_getLatestAssistantContext() {
+  /*
+   * 최신 ChatGPT DOM 우선:
+   * section[data-turn="assistant"]
+   *
+   * 구버전 fallback:
+   * [data-message-author-role="assistant"]
+   */
+  const rolloutAssistants =
+    Array.from(
+      document.querySelectorAll(
+        CHATGPT_ROLLOUT_ASSISTANT_SELECTOR
+      )
+    ).filter(function(node) {
+      return node && node.isConnected;
+    });
+
+  if (rolloutAssistants.length) {
+    const message =
+      rolloutAssistants[
+        rolloutAssistants.length - 1
+      ];
+
+    const turn =
+      message.closest('[data-turn-key]') ||
+      message.closest(
+        '[data-testid^="conversation-turn-"]'
+      ) ||
+      message.closest('article') ||
+      message;
+
+    const assistant =
+      message.querySelector(
+        '[data-markdown-text-style="assistant-message"]'
+      ) ||
+      message.querySelector('.markdown') ||
+      message;
+
+    return {
+      assistant: assistant,
+      message: message,
+      turn: turn,
+      renderer: 'rollout'
+    };
+  }
+
+  const rolloutTurns =
+    Array.from(
+      document.querySelectorAll(
+        '[data-turn-key]'
+      )
+    ).filter(function(turn) {
+      return (
+        turn.isConnected &&
+        turn.querySelector(
+          CHATGPT_ROLLOUT_ASSISTANT_MARKER_SELECTOR
+        )
+      );
+    });
+
+  if (rolloutTurns.length) {
+    const turn =
+      rolloutTurns[
+        rolloutTurns.length - 1
+      ];
+
+    const message =
+      turn.querySelector(
+        CHATGPT_ROLLOUT_ASSISTANT_SELECTOR
+      );
+
+    const assistant =
+      message?.querySelector(
+        '[data-markdown-text-style="assistant-message"]'
+      ) ||
+      turn.querySelector(
+        '[data-markdown-text-style="assistant-message"]'
+      ) ||
+      message ||
+      turn;
+
+    return {
+      assistant: assistant,
+      message: message || assistant,
+      turn: turn,
+      renderer: 'rollout'
+    };
+  }
+
+  const turnSelectors = [
+    'main section[data-turn="assistant"]',
+    'section[data-turn="assistant"]'
+  ];
+
+  let turns = [];
+
+  for (const selector of turnSelectors) {
+    turns = Array.from(
+      document.querySelectorAll(selector)
+    ).filter(function(node) {
+      return node && node.isConnected;
+    });
+
+    if (turns.length) {
+      break;
+    }
+  }
+
+  if (turns.length) {
+    const turn =
+      turns[turns.length - 1];
+
+    const assistant =
+      turn.querySelector(
+        '[data-message-author-role="assistant"]'
+      ) ||
+      turn.querySelector('.markdown') ||
+      turn.querySelector('[class*="markdown"]') ||
+      turn;
+
+    return {
+      assistant: assistant,
+      turn: turn
+    };
+  }
+
+  const legacy =
+    Array.from(
+      document.querySelectorAll(
+        '[data-message-author-role="assistant"]'
+      )
+    ).filter(function(node) {
+      return node && node.isConnected;
+    });
+
+  if (!legacy.length) {
+    return null;
+  }
+
+  const assistant =
+    legacy[legacy.length - 1];
+
+  const turn =
+    assistant.closest(
+      'section[data-turn="assistant"]'
+    ) ||
+    assistant.closest(
+      '[data-testid^="conversation-turn-"]'
+    ) ||
+    assistant.closest('article') ||
+    assistant;
+
+  return {
+    assistant: assistant,
+    turn: turn
+  };
+}
+
+function chatgpt_getCodeBlockCandidates(
+  assistant,
+  turn
+) {
+  const roots = [];
+
+  if (turn) {
+    roots.push(turn);
+  }
+
+  if (
+    assistant &&
+    assistant !== turn
+  ) {
+    roots.push(assistant);
+  }
+
+  const selectors = [
+    '[data-markdown-copy="code-block"]',
+    '[id="code-block-viewer"]',
+    '[id="code-block-viewer"] .cm-content',
+    'pre.cm-content',
+    '.markdown pre',
+    '.cm-content',
+    'pre'
+  ];
+
+  const seen =
+    new Set();
+
+  const candidates =
+    [];
+
+  roots.forEach(function(root) {
+    if (!root || !root.querySelectorAll) {
+      return;
+    }
+
+    selectors.forEach(function(selector) {
+      Array.from(
+        root.querySelectorAll(selector)
+      ).forEach(function(node) {
+        if (
+          !node ||
+          !node.isConnected ||
+          seen.has(node)
+        ) {
+          return;
+        }
+
+        const owningRolloutWidget =
+          node.closest?.(
+            '[data-markdown-copy="code-block"]'
+          );
+
+        if (
+          owningRolloutWidget &&
+          owningRolloutWidget !== node &&
+          seen.has(owningRolloutWidget)
+        ) {
+          return;
+        }
+
+        /*
+         * code-block-viewer 내부의 pre와
+         * 동일한 실제 코드블록이 중복 수집될 수 있으므로
+         * 실제 target을 정규화한다.
+         */
+        const target =
+          node.matches(
+            '[id="code-block-viewer"]'
+          )
+            ? (
+                node.querySelector(
+                  'pre.cm-content'
+                ) ||
+                node.querySelector(
+                  '.cm-content'
+                ) ||
+                node.querySelector(
+                  'pre'
+                ) ||
+                node
+              )
+            : node;
+
+        if (
+          !target ||
+          seen.has(target)
+        ) {
+          return;
+        }
+
+        seen.add(node);
+        seen.add(target);
+        candidates.push(target);
+      });
+    });
+  });
+
+  if (!candidates.length && assistant) {
+    Array.from(
+      assistant.querySelectorAll('code')
+    ).forEach(function(node) {
+      if (
+        node &&
+        node.isConnected &&
+        chatgpt_isVisible(node) &&
+        (node.textContent || '').trim() &&
+        !seen.has(node)
+      ) {
+        seen.add(node);
+        candidates.push(node);
+      }
+    });
+  }
+
+  /*
+   * DOM 순서대로 정렬.
+   * 마지막 코드블록을 정확히 선택하기 위함.
+   */
+  candidates.sort(function(a, b) {
+    if (a === b) {
+      return 0;
+    }
+
+    const position =
+      a.compareDocumentPosition(b);
+
+    if (
+      position &
+      Node.DOCUMENT_POSITION_FOLLOWING
+    ) {
+      return -1;
+    }
+
+    if (
+      position &
+      Node.DOCUMENT_POSITION_PRECEDING
+    ) {
+      return 1;
+    }
+
+    return 0;
+  });
+
+  return candidates;
+}
+
+function chatgpt_collectResponseDiagnostics() {
+  const rolloutAssistants =
+    document.querySelectorAll(
+      CHATGPT_ROLLOUT_ASSISTANT_SELECTOR
+    ).length;
+
+  const turnKeys =
+    document.querySelectorAll(
+      '[data-turn-key]'
+    ).length;
+
+  const assistantMarkdown =
+    document.querySelectorAll(
+      '[data-markdown-text-style="assistant-message"]'
+    ).length;
+
+  const codeWidgets =
+    document.querySelectorAll(
+      '[data-markdown-copy="code-block"]'
+    ).length;
+
+  const codeEditors =
+    document.querySelectorAll(
+      '[role="textbox"][aria-label="Edit code"]'
+    ).length;
+
+  const cmLines =
+    document.querySelectorAll(
+      '.cm-line'
+    ).length;
+
+  const assistantSections =
+    document.querySelectorAll(
+      'section[data-turn="assistant"]'
+    ).length;
+
+  const legacyAssistants =
+    document.querySelectorAll(
+      '[data-message-author-role="assistant"]'
+    ).length;
+
+  const codeViewers =
+    document.querySelectorAll(
+      '[id="code-block-viewer"]'
+    ).length;
+
+  const cmContents =
+    document.querySelectorAll(
+      '.cm-content'
+    ).length;
+
+  const preBlocks =
+    document.querySelectorAll(
+      'pre'
+    ).length;
+
+  const codeNodes =
+    document.querySelectorAll(
+      'code'
+    ).length;
+
+  const latestContext =
+    chatgpt_getLatestAssistantContext?.();
+
+  const turnCodeViewers =
+    latestContext?.turn
+      ? latestContext.turn.querySelectorAll(
+          '[id="code-block-viewer"]'
+        ).length
+      : 0;
+
+  const turnCmContents =
+    latestContext?.turn
+      ? latestContext.turn.querySelectorAll(
+          '.cm-content'
+        ).length
+      : 0;
+
+  const turnPreBlocks =
+    latestContext?.turn
+      ? latestContext.turn.querySelectorAll(
+          'pre'
+        ).length
+      : 0;
+
+  const turnCodeNodes =
+    latestContext?.turn
+      ? latestContext.turn.querySelectorAll(
+          'code'
+        ).length
+      : 0;
+
+  return {
+    build: CTB_RUNTIME_BUILD,
+    copyMode:
+      typeof copyMode !== 'undefined'
+        ? copyMode
+        : 'unknown',
+    rolloutAssistants,
+    turnKeys,
+    assistantMarkdown,
+    codeWidgets,
+    codeEditors,
+    cmLines,
+    assistantSections,
+    legacyAssistants,
+    codeViewers,
+    cmContents,
+    preBlocks,
+    codeNodes,
+    latestContext:
+      !!latestContext,
+    turnCodeViewers,
+    turnCmContents,
+    turnPreBlocks,
+    turnCodeNodes
+  };
+}
+
+function chatgpt_formatResponseDiagnostics(diag) {
+  return (
+    'AI 응답을 찾을 수 없어요.\n' +
+    '[' + diag.build + ']\n' +
+    'rollout=' + diag.rolloutAssistants +
+    ' / turns=' + diag.turnKeys +
+    ' / markdown=' + diag.assistantMarkdown + '\n' +
+    'widgets=' + diag.codeWidgets +
+    ' / editors=' + diag.codeEditors +
+    ' / lines=' + diag.cmLines + '\n' +
+    'assistant=' + diag.assistantSections +
+    ' / legacy=' + diag.legacyAssistants + '\n' +
+    'viewer=' + diag.codeViewers +
+    ' / cm=' + diag.cmContents +
+    ' / pre=' + diag.preBlocks +
+    ' / code=' + diag.codeNodes + '\n' +
+    'turn viewer=' + diag.turnCodeViewers +
+    ' / cm=' + diag.turnCmContents +
+    ' / pre=' + diag.turnPreBlocks +
+    ' / code=' + diag.turnCodeNodes
+  );
+}
+
+function chatgpt_logResponseDebug() {
+  const diag =
+    chatgpt_collectResponseDiagnostics();
+
+  window.__ctbLastResponseDiagnostic =
+    chatgpt_formatResponseDiagnostics(diag);
+
+  console.warn(
+    '[CTB ChatGPT response debug]',
+    diag
+  );
+
+  const statusEl =
+    document.querySelector(
+      '#ctb-ai-panel #ctb-status'
+    );
+
+  if (statusEl) {
+    setPanelStatus(
+      statusEl,
+      window.__ctbLastResponseDiagnostic,
+      'err'
+    );
+  }
+}
+
 function chatgpt_getResponse() {
-  const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-  if (!msgs.length) return null;
-  const last = msgs[msgs.length - 1];
-  const code = last.querySelectorAll('pre');
-  if (copyMode === 'code' && code.length) return code[code.length - 1].innerText?.trim() || null;
-  return last.innerText?.trim() || null;
+  const context =
+    chatgpt_getLatestAssistantContext();
+
+  if (!context) {
+    chatgpt_logResponseDebug();
+    return null;
+  }
+
+  const assistant =
+    context.assistant;
+
+  const turn =
+    context.turn;
+
+  if (copyMode === 'code') {
+    const candidates =
+      chatgpt_getCodeBlockCandidates(
+        assistant,
+        turn
+      );
+
+    for (
+      let index =
+        candidates.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const text =
+        chatgpt_extractCodeText(
+          candidates[index]
+        );
+
+      if (text.trim()) {
+        return text;
+      }
+    }
+
+    chatgpt_logResponseDebug();
+    return null;
+  }
+
+  const fullText =
+    typeof assistant.innerText === 'string'
+      ? assistant.innerText
+      : assistant.textContent || '';
+
+  const response =
+    fullText.trim() || null;
+
+  if (!response) {
+    chatgpt_logResponseDebug();
+  }
+
+  return response;
 }
 
 function chatgpt_isVisible(el) {
@@ -362,10 +1039,13 @@ function chatgpt_isStreaming() {
  return false;
 }
 
-const CHATGPT_SEND_BUTTON_SELECTOR =
- 'button[data-testid="send-button"], ' +
- 'button[aria-label="Send message"], ' +
- 'button[aria-label="메시지 보내기"]';
+const CHATGPT_SEND_SELECTORS = [
+  '#composer-submit-button',
+  'button[data-testid="send-button"]',
+  'button[type="submit"]',
+  'button[aria-label="Send prompt"]',
+  'button.composer-submit-btn'
+];
 
 function chatgpt_getInputEl() {
  const candidates = [
@@ -391,42 +1071,361 @@ function chatgpt_getInputEl() {
  );
 }
 
+function chatgpt_getComposerForm(input) {
+  if (input && input.isConnected) {
+    return (
+      input.closest('form') ||
+      input.closest(
+        '[data-type="unified-composer"]'
+      ) ||
+      input.closest(
+        '[data-testid*="composer"]'
+      ) ||
+      input.parentElement ||
+      null
+    );
+  }
+
+  return (
+    document.querySelector(
+      'form[data-type="unified-composer"]'
+    ) ||
+    null
+  );
+}
+
 function chatgpt_getComposerObserverScope(input) {
- if (!input || !input.isConnected) {
+  if (!input || !input.isConnected) {
+    return null;
+  }
+
+  const form =
+    chatgpt_getComposerForm(input);
+
+  return (
+    form ||
+    input.parentElement ||
+    null
+  );
+}
+
+function chatgpt_isSendButtonReady(button) {
+  if (!button || !button.isConnected) {
+    return false;
+  }
+
+  if (
+    button.disabled ||
+    button.getAttribute('aria-disabled') === 'true'
+  ) {
+    return false;
+  }
+
+  const rect =
+    button.getBoundingClientRect();
+
+  if (
+    rect.width <= 0 ||
+    rect.height <= 0
+  ) {
+    return false;
+  }
+
+  const style =
+    window.getComputedStyle(button);
+
+  if (
+    style.display === 'none' ||
+    style.visibility === 'hidden' ||
+    style.pointerEvents === 'none'
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function chatgpt_findSendButton(
+ input,
+ composerRoot
+) {
+ const form =
+ input?.closest?.('form') ||
+ composerRoot?.closest?.('form') ||
+ (
+ composerRoot?.matches?.('form')
+ ? composerRoot
+ : null
+ );
+
+ const scopes = [];
+
+ if (form) {
+ scopes.push(form);
+ }
+
+ if (
+ composerRoot &&
+ composerRoot !== form
+ ) {
+ scopes.push(composerRoot);
+ }
+
+ for (const scope of scopes) {
+ for (
+ const selector
+ of CHATGPT_SEND_SELECTORS
+ ) {
+ const buttons =
+ Array.from(
+ scope.querySelectorAll(selector)
+ );
+
+ for (const button of buttons) {
+ if (!button || !button.isConnected) {
+ continue;
+ }
+
+ const testId =
+ button.getAttribute(
+ 'data-testid'
+ ) || '';
+
+ const ariaLabel =
+ button.getAttribute(
+ 'aria-label'
+ ) || '';
+
+ if (
+ testId === 'stop-button' ||
+ /stop/i.test(ariaLabel)
+ ) {
+ continue;
+ }
+
+ return button;
+ }
+ }
+ }
+
  return null;
- }
- const form = input.closest('form');
- if (form && form.parentElement) {
- return form.parentElement;
- }
- return form || input.parentElement || null;
 }
 
 function chatgpt_getReadySendButton(input) {
- const form = input && input.closest('form');
- const roots = form ? [form, document] : [document];
+ const composerRoot =
+ chatgpt_getComposerForm(input);
 
- for (const root of roots) {
- const buttons = Array.from(
- root.querySelectorAll(CHATGPT_SEND_BUTTON_SELECTOR)
+ const button =
+ chatgpt_findSendButton(
+ input,
+ composerRoot
  );
 
- const readyButton = buttons.find(function(button) {
- return (
+ return chatgpt_isSendButtonReady(button)
+ ? button
+ : null;
+}
+
+function chatgpt_collectSendDiagnostics(
+ input,
+ composerRoot,
+ state
+) {
+ const form =
+ input?.closest?.('form') ||
+ composerRoot?.closest?.('form') ||
+ (
+ composerRoot?.matches?.('form')
+ ? composerRoot
+ : null
+ );
+
+ const scopes = [];
+
+ if (form) {
+ scopes.push(form);
+ }
+
+ if (
+ composerRoot &&
+ composerRoot !== form
+ ) {
+ scopes.push(composerRoot);
+ }
+
+ const seenButtons =
+ new Set();
+
+ const sendButtons =
+ [];
+
+ scopes.forEach(function(scope) {
+ CHATGPT_SEND_SELECTORS.forEach(function(selector) {
+ Array.from(
+ scope.querySelectorAll(selector)
+ ).forEach(function(button) {
+ const testId =
+ button?.getAttribute?.(
+ 'data-testid'
+ ) || '';
+
+ const ariaLabel =
+ button?.getAttribute?.(
+ 'aria-label'
+ ) || '';
+
+ if (
  button &&
  button.isConnected &&
- chatgpt_isVisible(button) &&
- !button.disabled &&
- button.getAttribute('aria-disabled') !== 'true'
- );
+ testId !== 'stop-button' &&
+ !/stop/i.test(ariaLabel) &&
+ !seenButtons.has(button)
+ ) {
+ seenButtons.add(button);
+ sendButtons.push(button);
+ }
+ });
+ });
  });
 
- if (readyButton) {
- return readyButton;
- }
- }
+ const readyButtons =
+ sendButtons.filter(
+ chatgpt_isSendButtonReady
+ );
 
- return null;
+ return {
+ build: CTB_RUNTIME_BUILD,
+ inputFound:
+ !!input,
+ composerFound:
+ !!composerRoot,
+ inputTextLength:
+ input
+ ? (
+ typeof input.value === 'string'
+ ? input.value.length
+ : (input.textContent || '').length
+ )
+ : 0,
+ sendButtonCount:
+ sendButtons.length,
+ readySendButtonCount:
+ readyButtons.length,
+ composerSubmit:
+ composerRoot
+ ? composerRoot.querySelectorAll(
+ '#composer-submit-button'
+ ).length
+ : 0,
+ formSubmit:
+ composerRoot
+ ? composerRoot.querySelectorAll(
+ 'button[type="submit"]'
+ ).length
+ : 0,
+ payloadChanged:
+ !!state?.payloadChanged,
+ mutationSeen:
+ !!state?.mutationSeen,
+ attachmentChanged:
+ !!state?.attachmentChanged,
+ sendBecameReady:
+ !!state?.sendBecameReady,
+ busy:
+ !!state?.busy
+ };
+}
+
+function chatgpt_formatSendDiagnostics(diag) {
+ const yesNo = function(value) {
+ return value ? 'YES' : 'NO';
+ };
+
+ return (
+ 'ChatGPT 자동 전송 실패 [' +
+ diag.build + ']\n' +
+ 'input=' + yesNo(diag.inputFound) + '\n' +
+ 'composer=' + yesNo(diag.composerFound) + '\n' +
+ 'send=' + diag.sendButtonCount +
+ ' / ready=' + diag.readySendButtonCount + '\n' +
+ 'composerSubmit=' + diag.composerSubmit +
+ ' / formSubmit=' + diag.formSubmit + '\n' +
+ 'payload=' + yesNo(diag.payloadChanged) + '\n' +
+ 'mutation=' + yesNo(diag.mutationSeen) + '\n' +
+ 'attachment=' + yesNo(diag.attachmentChanged) + '\n' +
+ 'becameReady=' + yesNo(diag.sendBecameReady) + '\n' +
+ 'busy=' + yesNo(diag.busy)
+ );
+}
+
+const CHATGPT_ATTACHMENT_REMOVE_SELECTOR =
+  'button[aria-label^="Remove file"], ' +
+  'button[aria-label*="Remove file"], ' +
+  'button[aria-label^="파일 제거"], ' +
+  'button[aria-label*="파일 제거"]';
+
+const CHATGPT_ATTACHMENT_TILE_SELECTOR =
+  '[class*="file-tile"], ' +
+  '[data-testid*="file-tile"], ' +
+  '[data-testid*="attachment"]';
+
+function chatgpt_getAttachmentState(input) {
+  const form =
+    chatgpt_getComposerForm(input);
+
+  if (!form) {
+    return {
+      count: 0,
+      busy: false
+    };
+  }
+
+  const removeButtons =
+    Array.from(
+      form.querySelectorAll(
+        CHATGPT_ATTACHMENT_REMOVE_SELECTOR
+      )
+    ).filter(chatgpt_isVisible);
+
+  const fileTiles =
+    Array.from(
+      form.querySelectorAll(
+        CHATGPT_ATTACHMENT_TILE_SELECTOR
+      )
+    ).filter(function(tile) {
+      if (!chatgpt_isVisible(tile)) {
+        return false;
+      }
+
+      if (
+        tile.closest(
+          'button[data-testid="composer-plus-btn"]'
+        )
+      ) {
+        return false;
+      }
+
+      return true;
+    });
+
+  const busyIndicators =
+    Array.from(
+      form.querySelectorAll(
+        '[role="progressbar"], ' +
+        'progress, ' +
+        '[aria-busy="true"]'
+      )
+    ).filter(chatgpt_isVisible);
+
+  return {
+    count:
+      Math.max(
+        removeButtons.length,
+        fileTiles.length
+      ),
+    busy:
+      busyIndicators.length > 0
+  };
 }
 
 function chatgpt_normalizeComposerText(text) {
@@ -581,13 +1580,28 @@ function chatgpt_composerLooksComplete(
 
 function chatgpt_waitForReadyAndSend(
  expectedText,
- timeoutMs
+ timeoutMs,
+ changeTracker
 ) {
  return new Promise(function(resolve) {
  const anchors =
  chatgpt_getTransferAnchors(
  expectedText
  );
+
+ const tracker =
+ changeTracker || {};
+
+ const initialAttachmentCount =
+ Number.isFinite(Number(tracker.attachmentCount))
+ ? Number(tracker.attachmentCount)
+ : 0;
+
+ const baselineText =
+ String(tracker.text || '');
+
+ const baselineSendReady =
+ tracker.sendReady === true;
 
  let finished = false;
  let scopeObserver = null;
@@ -596,7 +1610,23 @@ function chatgpt_waitForReadyAndSend(
  let observedScope = null;
  let observedInput = null;
  let checkQueued = false;
- let lastRawLength = -1;
+ let stableSince = 0;
+ let stableMutationVersion = -1;
+ let stableTimer = null;
+ const diagnosticState = {
+ payloadChanged: false,
+ mutationSeen: false,
+ attachmentChanged: false,
+ sendBecameReady: false,
+ busy: false
+ };
+
+ const markMutation = function() {
+ tracker.mutationSeen = true;
+ tracker.mutationVersion =
+ Number(tracker.mutationVersion || 0) + 1;
+ requestCheck();
+ };
 
  const cleanup = function() {
  if (scopeObserver) {
@@ -610,6 +1640,16 @@ function chatgpt_waitForReadyAndSend(
  if (timer) {
  clearTimeout(timer);
  }
+
+ if (stableTimer) {
+ clearTimeout(stableTimer);
+ }
+
+ if (tracker.observer) {
+ tracker.observer.disconnect();
+ }
+
+ tracker.onMutation = null;
  };
 
  const finish = function(result) {
@@ -638,6 +1678,17 @@ function chatgpt_waitForReadyAndSend(
  });
  };
 
+ const scheduleStableCheck = function(delay) {
+ if (stableTimer) {
+ clearTimeout(stableTimer);
+ }
+
+ stableTimer = setTimeout(
+ requestCheck,
+ delay
+ );
+ };
+
  const observeScope = function(scope) {
  if (
  !scope ||
@@ -658,11 +1709,14 @@ function chatgpt_waitForReadyAndSend(
  {
  subtree: true,
  childList: true,
+ characterData: true,
  attributes: true,
  attributeFilter: [
  'disabled',
  'aria-disabled',
- 'hidden'
+ 'aria-busy',
+ 'data-state',
+ 'class'
  ]
  }
  );
@@ -682,7 +1736,6 @@ function chatgpt_waitForReadyAndSend(
  }
 
  observedInput = input;
- lastRawLength = -1;
 
  inputObserver.observe(
  observedInput,
@@ -714,60 +1767,143 @@ function chatgpt_waitForReadyAndSend(
  )
  );
 
- const button =
- chatgpt_getReadySendButton(
+ const attachmentState =
+ chatgpt_getAttachmentState(
  input
  );
 
- if (!button) {
- return;
- }
+ const currentText =
+ String(
+ chatgpt_normalizeComposerText(
+ getContentEditablePlainText(input)
+ ) || ''
+ );
 
- const rawLength =
- (
- input.textContent ||
- ''
- ).length;
-
- if (
- rawLength ===
- lastRawLength
- ) {
- return;
- }
-
- lastRawLength = rawLength;
-
- if (
- !chatgpt_composerLooksComplete(
+ const button =
+ chatgpt_findSendButton(
  input,
- anchors
- )
+ chatgpt_getComposerForm(input)
+ );
+
+ const sendButtonReady =
+ chatgpt_isSendButtonReady(button);
+
+ const payloadChanged =
+ currentText !== baselineText ||
+ attachmentState.count >
+ initialAttachmentCount ||
+ tracker.mutationSeen === true ||
+ (
+ !baselineSendReady &&
+ sendButtonReady
+ );
+
+ diagnosticState.payloadChanged =
+ payloadChanged;
+ diagnosticState.mutationSeen =
+ tracker.mutationSeen === true;
+ diagnosticState.attachmentChanged =
+ attachmentState.count >
+ initialAttachmentCount;
+ diagnosticState.sendBecameReady =
+ !baselineSendReady &&
+ sendButtonReady;
+ diagnosticState.busy =
+ attachmentState.busy;
+
+ const ready =
+ payloadChanged &&
+ sendButtonReady &&
+ !attachmentState.busy;
+
+ if (!ready) {
+ stableSince = 0;
+ stableMutationVersion = -1;
+
+ if (stableTimer) {
+ clearTimeout(stableTimer);
+ stableTimer = null;
+ }
+
+ return;
+ }
+
+ const mutationVersion =
+ Number(tracker.mutationVersion || 0);
+
+ if (
+ stableSince === 0 ||
+ stableMutationVersion !== mutationVersion
  ) {
+ stableSince = Date.now();
+ stableMutationVersion = mutationVersion;
+ scheduleStableCheck(500);
+ return;
+ }
+
+ const stableElapsed =
+ Date.now() - stableSince;
+
+ if (stableElapsed < 500) {
+ scheduleStableCheck(500 - stableElapsed);
+ return;
+ }
+
+ const latestInput =
+ chatgpt_getInputEl();
+
+ const latestComposerRoot =
+ chatgpt_getComposerForm(
+ latestInput
+ );
+
+ const latestButton =
+ chatgpt_findSendButton(
+ latestInput,
+ latestComposerRoot
+ );
+
+ const latestAttachmentState =
+ chatgpt_getAttachmentState(latestInput);
+
+ if (
+ !chatgpt_isSendButtonReady(latestButton) ||
+ latestAttachmentState.busy
+ ) {
+ stableSince = 0;
+ stableMutationVersion = -1;
  return;
  }
 
  finished = true;
  cleanup();
 
- button.click();
+ latestButton.click();
 
  resolve({
  ok: true,
  pasted: true,
- sent: true
+ sent: true,
+ transferMode:
+ latestAttachmentState.count >
+ initialAttachmentCount
+ ? 'attachment'
+ : 'inline'
  });
  };
 
  scopeObserver =
  new MutationObserver(
- requestCheck
+ markMutation
  );
 
  inputObserver =
  new MutationObserver(
- requestCheck
+ markMutation
  );
+
+ tracker.onMutation =
+ requestCheck;
 
  const initialInput =
  chatgpt_getInputEl();
@@ -783,10 +1919,71 @@ function chatgpt_waitForReadyAndSend(
  }
 
  timer = setTimeout(function() {
+ const timeoutInput =
+ chatgpt_getInputEl();
+
+ const composerRoot =
+ chatgpt_getComposerForm(
+ timeoutInput
+ );
+
+ const timeoutAttachmentState =
+ chatgpt_getAttachmentState(
+ timeoutInput
+ );
+
+ const timeoutSendReady =
+ chatgpt_isSendButtonReady(
+ chatgpt_findSendButton(
+ timeoutInput,
+ composerRoot
+ )
+ );
+
+ const timeoutText =
+ timeoutInput
+ ? String(
+ chatgpt_normalizeComposerText(
+ getContentEditablePlainText(
+ timeoutInput
+ )
+ ) || ''
+ )
+ : '';
+
+ diagnosticState.payloadChanged =
+ timeoutText !== baselineText ||
+ timeoutAttachmentState.count >
+ initialAttachmentCount ||
+ tracker.mutationSeen === true ||
+ (
+ !baselineSendReady &&
+ timeoutSendReady
+ );
+ diagnosticState.mutationSeen =
+ tracker.mutationSeen === true;
+ diagnosticState.attachmentChanged =
+ timeoutAttachmentState.count >
+ initialAttachmentCount;
+ diagnosticState.sendBecameReady =
+ !baselineSendReady &&
+ timeoutSendReady;
+ diagnosticState.busy =
+ timeoutAttachmentState.busy;
+
+ const diag =
+ chatgpt_collectSendDiagnostics(
+ timeoutInput,
+ composerRoot,
+ diagnosticState
+ );
+
  finish({
  ok: false,
  error:
- 'ChatGPT 입력이 끝까지 완료되지 않아 자동 전송하지 않았어요.'
+ chatgpt_formatSendDiagnostics(
+ diag
+ )
  });
  }, timeoutMs);
 
@@ -833,6 +2030,67 @@ async function chatgpt_pasteInput(
  };
  }
 
+ const attachmentStateBefore =
+ chatgpt_getAttachmentState(
+ input
+ );
+
+ const sendButtonBefore =
+ chatgpt_findSendButton(
+ input,
+ chatgpt_getComposerForm(input)
+ );
+
+ const changeTracker = {
+ text:
+ chatgpt_normalizeComposerText(
+ getContentEditablePlainText(input)
+ ),
+ attachmentCount:
+ attachmentStateBefore.count,
+ sendReady:
+ chatgpt_isSendButtonReady(
+ sendButtonBefore
+ ),
+ mutationSeen: false,
+ mutationVersion: 0,
+ onMutation: null,
+ observer: null
+ };
+
+ if (autoSend) {
+ const composerRoot =
+ chatgpt_getComposerForm(input);
+
+ if (composerRoot) {
+ changeTracker.observer =
+ new MutationObserver(function() {
+ changeTracker.mutationSeen = true;
+ changeTracker.mutationVersion += 1;
+
+ if (changeTracker.onMutation) {
+ changeTracker.onMutation();
+ }
+ });
+
+ changeTracker.observer.observe(
+ composerRoot,
+ {
+ childList: true,
+ subtree: true,
+ characterData: true,
+ attributes: true,
+ attributeFilter: [
+ 'disabled',
+ 'aria-disabled',
+ 'data-state',
+ 'class'
+ ]
+ }
+ );
+ }
+ }
+
  const pasted =
  chatgpt_pasteOnce(
  input,
@@ -840,6 +2098,10 @@ async function chatgpt_pasteInput(
  );
 
  if (!pasted) {
+ if (changeTracker.observer) {
+ changeTracker.observer.disconnect();
+ }
+
  return {
  ok: false,
  error:
@@ -858,7 +2120,8 @@ async function chatgpt_pasteInput(
  return await
  chatgpt_waitForReadyAndSend(
  expectedText,
- 15000
+ 20000,
+ changeTracker
  );
  } finally {
  chatgpt_pasteInput.__busy =
@@ -1659,7 +2922,56 @@ function telegram_getMessageForMode(mode) {
   return telegram_getLastBotMessage();
 }
 
-const TELEGRAM_SEND_BUTTON_SELECTOR = 'button.btn-send, ' + 'button.bubbles-corner-button:not(.chat-secondary-button), ' + 'button[aria-label*="Send"], ' + 'button[aria-label*="보내"]';function telegram_isVisibleElement(el) { if (!el || !el.isConnected) { return false; } if (el.closest('[hidden], [aria-hidden="true"], [inert]')) { return false; } const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || style.pointerEvents === 'none') { return false; } const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) { return false; } return (rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth);}function telegram_getVisibleComposerInputs() { return Array.from(document.querySelectorAll('div.input-message-input[contenteditable="true"]')).filter(telegram_isVisibleElement);}function telegram_getVisibleButtonsInScope(scope) { if (!scope || !scope.querySelectorAll) { return []; } return Array.from(scope.querySelectorAll(TELEGRAM_SEND_BUTTON_SELECTOR)).filter(telegram_isVisibleElement);}function telegram_findComposerScope(input) { if (!input || !input.isConnected) { return null; } let node = input.parentElement; while (node && node !== document.body) { if (telegram_getVisibleButtonsInScope(node).length > 0) { return node; } node = node.parentElement; } return (input.closest('main') || input.parentElement || document.body);}function telegram_getNearestSendButton(scope, input) { const buttons = telegram_getVisibleButtonsInScope(scope); if (!buttons.length) { return null; } if (!input) { return buttons[0]; } const inputRect = input.getBoundingClientRect(); const inputX = inputRect.left + inputRect.width / 2; const inputY = inputRect.top + inputRect.height / 2; return buttons.map(function(button) { const rect = button.getBoundingClientRect(); const buttonX = rect.left + rect.width / 2; const buttonY = rect.top + rect.height / 2; return { button: button, distance: Math.abs(buttonX - inputX) + Math.abs(buttonY - inputY) }; }).sort(function(a, b) { return a.distance - b.distance; })[0].button;}function telegram_getComposerInput() { const candidates = telegram_getVisibleComposerInputs(); if (!candidates.length) { return null; } const activeElement = document.activeElement; if (activeElement && candidates.includes(activeElement)) { return activeElement; } const pairedCandidates = candidates.filter(function(input) { const scope = telegram_findComposerScope(input); return !!telegram_getNearestSendButton(scope, input); }); const source = pairedCandidates.length ? pairedCandidates : candidates; return source.map(function(input) { const rect = input.getBoundingClientRect(); const scope = telegram_findComposerScope(input); const button = telegram_getNearestSendButton(scope, input); return { input: input, hasButton: !!button, bottom: rect.bottom, area: rect.width * rect.height }; }).sort(function(a, b) { if (a.hasButton !== b.hasButton) { return a.hasButton ? -1 : 1; } if (a.bottom !== b.bottom) { return b.bottom - a.bottom; } return b.area - a.area; })[0].input;}function telegram_getSendButton(scope, input) { return telegram_getNearestSendButton(scope, input);}function telegram_getCurrentChatKey() {
+const TELEGRAM_SEND_BUTTON_SELECTOR = 'button.btn-send, ' + 'button.bubbles-corner-button:not(.chat-secondary-button), ' + 'button[aria-label*="Send"], ' + 'button[aria-label*="보내"]';
+const TELEGRAM_TEXT_CHUNK_LIMIT = 3500;
+
+function telegram_splitTextIntoChunks(
+  text,
+  maxLength = TELEGRAM_TEXT_CHUNK_LIMIT
+) {
+  const source = String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+
+  if (!source) {
+    return [];
+  }
+
+  if (source.length <= maxLength) {
+    return [source];
+  }
+
+  const chunks = [];
+  let offset = 0;
+
+  while (
+    source.length - offset >
+    maxLength
+  ) {
+    const limit = offset + maxLength;
+    let splitAt =
+      source.lastIndexOf('\n', limit - 1);
+
+    if (splitAt < offset) {
+      splitAt = limit;
+    } else {
+      splitAt += 1;
+    }
+
+    chunks.push(
+      source.slice(offset, splitAt)
+    );
+
+    offset = splitAt;
+  }
+
+  if (offset < source.length) {
+    chunks.push(source.slice(offset));
+  }
+
+  return chunks;
+}
+function telegram_isVisibleElement(el) { if (!el || !el.isConnected) { return false; } if (el.closest('[hidden], [aria-hidden="true"], [inert]')) { return false; } const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || style.pointerEvents === 'none') { return false; } const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) { return false; } return (rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth);}function telegram_getVisibleComposerInputs() { return Array.from(document.querySelectorAll('div.input-message-input[contenteditable="true"]')).filter(telegram_isVisibleElement);}function telegram_getVisibleButtonsInScope(scope) { if (!scope || !scope.querySelectorAll) { return []; } return Array.from(scope.querySelectorAll(TELEGRAM_SEND_BUTTON_SELECTOR)).filter(telegram_isVisibleElement);}function telegram_findComposerScope(input) { if (!input || !input.isConnected) { return null; } let node = input.parentElement; while (node && node !== document.body) { if (telegram_getVisibleButtonsInScope(node).length > 0) { return node; } node = node.parentElement; } return (input.closest('main') || input.parentElement || document.body);}function telegram_getNearestSendButton(scope, input) { const buttons = telegram_getVisibleButtonsInScope(scope); if (!buttons.length) { return null; } if (!input) { return buttons[0]; } const inputRect = input.getBoundingClientRect(); const inputX = inputRect.left + inputRect.width / 2; const inputY = inputRect.top + inputRect.height / 2; return buttons.map(function(button) { const rect = button.getBoundingClientRect(); const buttonX = rect.left + rect.width / 2; const buttonY = rect.top + rect.height / 2; return { button: button, distance: Math.abs(buttonX - inputX) + Math.abs(buttonY - inputY) }; }).sort(function(a, b) { return a.distance - b.distance; })[0].button;}function telegram_getComposerInput() { const candidates = telegram_getVisibleComposerInputs(); if (!candidates.length) { return null; } const activeElement = document.activeElement; if (activeElement && candidates.includes(activeElement)) { return activeElement; } const pairedCandidates = candidates.filter(function(input) { const scope = telegram_findComposerScope(input); return !!telegram_getNearestSendButton(scope, input); }); const source = pairedCandidates.length ? pairedCandidates : candidates; return source.map(function(input) { const rect = input.getBoundingClientRect(); const scope = telegram_findComposerScope(input); const button = telegram_getNearestSendButton(scope, input); return { input: input, hasButton: !!button, bottom: rect.bottom, area: rect.width * rect.height }; }).sort(function(a, b) { if (a.hasButton !== b.hasButton) { return a.hasButton ? -1 : 1; } if (a.bottom !== b.bottom) { return b.bottom - a.bottom; } return b.area - a.area; })[0].input;}function telegram_getSendButton(scope, input) { return telegram_getNearestSendButton(scope, input);}function telegram_getCurrentChatKey() {
  return (
  String(location.pathname || '') +
  String(location.hash || '')
@@ -1771,6 +3083,718 @@ function telegram_getTransferSendButton(
  transferContext.scope,
  input
  );
+}
+
+function telegram_createTextFileName() {
+  const now = new Date();
+
+  const yyyy = String(now.getFullYear());
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mi = String(now.getMinutes()).padStart(2, '0');
+  const ss = String(now.getSeconds()).padStart(2, '0');
+
+  return (
+    'ai-response-' +
+    yyyy +
+    mm +
+    dd +
+    '-' +
+    hh +
+    mi +
+    ss +
+    '.txt'
+  );
+}
+
+function telegram_createTextFile(text) {
+  return new File(
+    [text],
+    telegram_createTextFileName(),
+    {
+      type: 'text/plain;charset=utf-8',
+      lastModified: Date.now()
+    }
+  );
+}
+
+function telegram_getFileInputCandidates(transferContext) {
+  const roots = [];
+
+  if (
+    transferContext &&
+    transferContext.scope
+  ) {
+    roots.push(transferContext.scope);
+  }
+
+  roots.push(document);
+
+  const found = [];
+  const seen = new Set();
+
+  roots.forEach(function(root) {
+    if (!root || !root.querySelectorAll) {
+      return;
+    }
+
+    Array.from(
+      root.querySelectorAll(
+        'input[type="file"]'
+      )
+    ).forEach(function(input) {
+      if (
+        !input ||
+        !input.isConnected ||
+        seen.has(input)
+      ) {
+        return;
+      }
+
+      seen.add(input);
+      found.push(input);
+    });
+  });
+
+  /*
+   * 일반 파일을 받을 가능성이 높은 input 우선.
+   * accept가 없는 input을 최우선으로 한다.
+   */
+  found.sort(function(a, b) {
+    const acceptA =
+      String(a.getAttribute('accept') || '');
+
+    const acceptB =
+      String(b.getAttribute('accept') || '');
+
+    const score = function(accept) {
+      if (!accept) return 0;
+
+      if (
+        accept.includes('text') ||
+        accept.includes('*/*') ||
+        accept.includes('application')
+      ) {
+        return 1;
+      }
+
+      return 2;
+    };
+
+    return score(acceptA) - score(acceptB);
+  });
+
+  return found;
+}
+
+function telegram_assignFileToInput(
+  input,
+  file
+) {
+  if (
+    !input ||
+    !input.isConnected ||
+    !file
+  ) {
+    return false;
+  }
+
+  try {
+    const dataTransfer =
+      new DataTransfer();
+
+    dataTransfer.items.add(file);
+
+    const filesSetter =
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        'files'
+      )?.set;
+
+    if (filesSetter) {
+      filesSetter.call(
+        input,
+        dataTransfer.files
+      );
+    } else {
+      input.files =
+        dataTransfer.files;
+    }
+
+    input.dispatchEvent(
+      new Event(
+        'input',
+        {
+          bubbles: true
+        }
+      )
+    );
+
+    input.dispatchEvent(
+      new Event(
+        'change',
+        {
+          bubbles: true
+        }
+      )
+    );
+
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function telegram_getVisibleSendButtons() {
+  return Array.from(
+    document.querySelectorAll(
+      TELEGRAM_SEND_BUTTON_SELECTOR
+    )
+  ).filter(
+    telegram_isVisibleElement
+  );
+}
+
+function telegram_getVisibleFilePopup() {
+  const selectors = [
+    '.popup-new-media',
+    '.popup-send-photo'
+  ];
+
+  const candidates = [];
+
+  selectors.forEach(function(selector) {
+    document
+      .querySelectorAll(selector)
+      .forEach(function(node) {
+        if (
+          telegram_isVisibleElement(node) &&
+          !candidates.includes(node)
+        ) {
+          candidates.push(node);
+        }
+      });
+  });
+
+  return candidates.length
+    ? candidates[candidates.length - 1]
+    : null;
+}
+
+function telegram_getFilePopupSendButton(
+  popup
+) {
+  if (!popup) {
+    return null;
+  }
+
+  const selectors = [
+    'button.btn-primary.btn-color-primary',
+    '.btn-primary.btn-color-primary'
+  ];
+
+  for (const selector of selectors) {
+    const buttons =
+      Array.from(
+        popup.querySelectorAll(selector)
+      );
+
+    for (const button of buttons) {
+      if (
+        !(button instanceof HTMLElement) ||
+        !telegram_isVisibleElement(button)
+      ) {
+        continue;
+      }
+
+      if (
+        button.disabled ||
+        button.getAttribute(
+          'aria-disabled'
+        ) === 'true'
+      ) {
+        continue;
+      }
+
+      return button;
+    }
+  }
+
+  return null;
+}
+
+function telegram_isFilePopupBusy(
+  popup
+) {
+  if (!popup) {
+    return true;
+  }
+
+  const busySelectors = [
+    '[aria-busy="true"]',
+    '[role="progressbar"]',
+    'progress',
+    '.progress',
+    '.progress-circle',
+    '[class*="upload-progress"]',
+    '[class*="progress-circle"]',
+    '[class*="spinner"]'
+  ];
+
+  return busySelectors.some(
+    function(selector) {
+      return Array.from(
+        popup.querySelectorAll(selector)
+      ).some(
+        telegram_isVisibleElement
+      );
+    }
+  );
+}
+
+function telegram_collectFilePopupDiagnostics() {
+  const popups =
+    Array.from(
+      document.querySelectorAll(
+        '.popup-new-media, ' +
+        '.popup-send-photo'
+      )
+    ).filter(
+      telegram_isVisibleElement
+    );
+
+  const popup =
+    popups.length
+      ? popups[popups.length - 1]
+      : null;
+
+  const confirms =
+    popup
+      ? Array.from(
+          popup.querySelectorAll(
+            'button.btn-primary.btn-color-primary, ' +
+            '.btn-primary.btn-color-primary'
+          )
+        ).filter(
+          telegram_isVisibleElement
+        )
+      : [];
+
+  return {
+    popupCount: popups.length,
+    confirmCount: confirms.length,
+    busy:
+      popup
+        ? telegram_isFilePopupBusy(popup)
+        : false,
+    fileInputCount:
+      document.querySelectorAll(
+        'input[type="file"]'
+      ).length
+  };
+}
+
+function telegram_formatFilePopupDiagnostics(
+  diag
+) {
+  return (
+    '[058-14]\n' +
+    'popup=' + diag.popupCount + '\n' +
+    'confirm=' + diag.confirmCount + '\n' +
+    'busy=' +
+      (diag.busy ? 'YES' : 'NO') + '\n' +
+    'fileInputs=' + diag.fileInputCount
+  );
+}
+
+function telegram_getFileSendUi(
+  previousButtons
+) {
+  void previousButtons;
+
+  const popup =
+    telegram_getVisibleFilePopup();
+
+  const button =
+    telegram_getFilePopupSendButton(
+      popup
+    );
+
+  return popup && button
+    ? {
+        root: popup,
+        button: button
+      }
+    : null;
+}
+
+function telegram_fileUiIsBusy(root) {
+  return telegram_isFilePopupBusy(root);
+}
+
+async function telegram_waitForFileSendUi(
+  transferContext,
+  previousButtons,
+  timeoutMs
+) {
+  const deadline =
+    Date.now() + timeoutMs;
+
+  let stableSince = 0;
+  let stablePopup = null;
+  let stableButton = null;
+
+  while (Date.now() < deadline) {
+    if (
+      !telegram_isTransferChatCurrent(
+        transferContext
+      )
+    ) {
+      return {
+        ok: false,
+        changedChat: true,
+        ui: null
+      };
+    }
+
+    const popup =
+      telegram_getVisibleFilePopup();
+
+    const button =
+      telegram_getFilePopupSendButton(
+        popup
+      );
+
+    if (
+      popup &&
+      button &&
+      !telegram_isFilePopupBusy(
+        popup
+      )
+    ) {
+      if (
+        stablePopup !== popup ||
+        stableButton !==
+        button
+      ) {
+        stablePopup = popup;
+        stableButton =
+          button;
+
+        stableSince =
+          Date.now();
+      }
+
+      /*
+       * 첨부 UI가 순간적으로 나타난 직후가 아니라
+       * 500ms 이상 안정된 뒤 전송한다.
+       */
+      if (
+        Date.now() -
+        stableSince >=
+        500
+      ) {
+        return {
+          ok: true,
+          changedChat: false,
+          ui: {
+            root: popup,
+            button: button
+          }
+        };
+      }
+    } else {
+      stablePopup = null;
+      stableButton = null;
+      stableSince = 0;
+    }
+
+    await sleep(150);
+  }
+
+  return {
+    ok: false,
+    changedChat:
+      !telegram_isTransferChatCurrent(
+        transferContext
+      ),
+    ui: null
+  };
+}
+
+async function telegram_waitForFileSendCompletion(
+  transferContext,
+  fileUi,
+  timeoutMs
+) {
+  const deadline =
+    Date.now() + timeoutMs;
+
+  let completedSince = 0;
+
+  while (Date.now() < deadline) {
+    if (
+      !telegram_isTransferChatCurrent(
+        transferContext
+      )
+    ) {
+      return {
+        ok: false,
+        changedChat: true,
+        uncertain: true
+      };
+    }
+
+    /*
+     * 첨부 dialog 또는 사용했던 send button이
+     * DOM에서 사라지면 전송 완료로 본다.
+     */
+    const rootGone =
+      !fileUi.root ||
+      !fileUi.root.isConnected ||
+      !telegram_isVisibleElement(
+        fileUi.root
+      );
+
+    const buttonGone =
+      !fileUi.button ||
+      !fileUi.button.isConnected ||
+      !telegram_isVisibleElement(
+        fileUi.button
+      );
+
+    const currentPopup =
+      telegram_getVisibleFilePopup();
+
+    const replacementPopup =
+      currentPopup &&
+      currentPopup !== fileUi.root;
+
+    if (
+      (rootGone || buttonGone) &&
+      !replacementPopup
+    ) {
+      if (!completedSince) {
+        completedSince = Date.now();
+      }
+
+      if (
+        Date.now() - completedSince >=
+        300
+      ) {
+        return {
+          ok: true,
+          changedChat: false,
+          uncertain: false
+        };
+      }
+    } else {
+      completedSince = 0;
+    }
+
+    await sleep(100);
+  }
+
+  return {
+    ok: false,
+    changedChat:
+      !telegram_isTransferChatCurrent(
+        transferContext
+      ),
+    uncertain: true
+  };
+}
+
+async function telegram_sendTextFile(
+  text,
+  autoSend,
+  transferContext
+) {
+  const file =
+    telegram_createTextFile(text);
+
+  const candidates =
+    telegram_getFileInputCandidates(
+      transferContext
+    );
+
+  if (!candidates.length) {
+    return {
+      ok: false,
+      error:
+        'Telegram 파일 첨부 입력을 찾을 수 없어요.'
+    };
+  }
+
+  const previousButtons =
+    telegram_getVisibleSendButtons();
+
+  let attached = false;
+
+  for (const input of candidates) {
+    if (
+      telegram_assignFileToInput(
+        input,
+        file
+      )
+    ) {
+      /*
+       * Telegram이 change 이벤트를 처리할 시간을 준다.
+       */
+      await sleep(250);
+
+      const earlyUi =
+        telegram_getFileSendUi(
+          previousButtons
+        );
+
+      if (
+        earlyUi ||
+        (
+          input.files &&
+          input.files.length
+        )
+      ) {
+        attached = true;
+        break;
+      }
+
+      /*
+       * Telegram이 input.files를 즉시 비우면서
+       * 내부 상태로 가져가는 경우도 있으므로
+       * 짧게 한 번 더 확인한다.
+       */
+      await sleep(350);
+
+      if (
+        telegram_getFileSendUi(
+          previousButtons
+        )
+      ) {
+        attached = true;
+        break;
+      }
+    }
+  }
+
+  if (!attached) {
+    return {
+      ok: false,
+      error:
+        'Telegram에 .txt 파일을 첨부하지 못했어요.'
+    };
+  }
+
+  const ready =
+    await telegram_waitForFileSendUi(
+      transferContext,
+      previousButtons,
+      12000
+    );
+
+  if (ready.changedChat) {
+    return {
+      ok: false,
+      error:
+        '파일 첨부 중 Telegram 채팅이 변경되어 중단했습니다.'
+    };
+  }
+
+  if (!ready.ok) {
+    const diag =
+      telegram_collectFilePopupDiagnostics();
+
+    return {
+      ok: false,
+      error:
+        'Telegram 파일 첨부는 시작됐지만 전송 준비 완료를 확인하지 못했습니다.\n' +
+        telegram_formatFilePopupDiagnostics(
+          diag
+        )
+    };
+  }
+
+  if (!autoSend) {
+    return {
+      ok: true,
+      pasted: true,
+      sent: false,
+      transferMode: 'file',
+      fileName: file.name
+    };
+  }
+
+  const finalPopup =
+    telegram_getVisibleFilePopup();
+
+  const finalButton =
+    telegram_getFilePopupSendButton(
+      finalPopup
+    );
+
+  if (
+    !finalPopup ||
+    !telegram_isVisibleElement(
+      finalPopup
+    ) ||
+    !finalButton ||
+    !telegram_isVisibleElement(
+      finalButton
+    ) ||
+    finalButton.disabled ||
+    finalButton.getAttribute(
+      'aria-disabled'
+    ) === 'true' ||
+    telegram_isFilePopupBusy(
+      finalPopup
+    )
+  ) {
+    return {
+      ok: false,
+      error:
+        'Telegram 파일 전송 버튼 상태가 변경되었습니다. 직접 전송해주세요.'
+    };
+  }
+
+  /*
+   * 파일 전송 버튼은 정확히 한 번만 클릭한다.
+   */
+  finalButton.click();
+
+  const completion =
+    await telegram_waitForFileSendCompletion(
+      transferContext,
+      {
+        root: finalPopup,
+        button: finalButton
+      },
+      12000
+    );
+
+  if (completion.ok) {
+    return {
+      ok: true,
+      pasted: true,
+      sent: true,
+      transferMode: 'file',
+      fileName: file.name
+    };
+  }
+
+  if (completion.changedChat) {
+    return {
+      ok: false,
+      error:
+        '파일 전송 버튼은 한 번 클릭했지만 채팅이 변경되어 결과를 확인할 수 없습니다.'
+    };
+  }
+
+  return {
+    ok: false,
+    error:
+      '파일 전송 버튼은 한 번 클릭했지만 완료를 확인하지 못했습니다. 중복 방지를 위해 다시 전송하지 않았습니다.'
+  };
 }
 
 function telegram_normalizeComposerText(text) {
@@ -2161,12 +4185,12 @@ async function telegram_sendMessage(
  telegram_sendMessage.__busy = true;
 
  try {
- const normalizedText =
- telegram_normalizeComposerText(
+ const fileText =
+ normalizeBridgeText(
  text
  );
 
- if (!normalizedText) {
+ if (!fileText.trim()) {
  return {
  ok: false,
  error:
@@ -2187,6 +4211,19 @@ async function telegram_sendMessage(
  ok: false,
  error:
  'Telegram 입력창을 찾을 수 없어요.'
+ };
+ }
+
+ const normalizedText =
+ normalizeBridgeText(
+ text
+ );
+
+ if (!normalizedText) {
+ return {
+ ok: false,
+ error:
+ '전송할 내용이 없어요.'
  };
  }
 
@@ -2328,6 +4365,48 @@ async function telegram_sendMessage(
  telegram_sendMessage.__busy =
  false;
  }
+}
+
+async function telegram_sendTextChunks(
+ text,
+ autoSend
+) {
+ const chunks =
+ telegram_splitTextIntoChunks(text);
+
+ if (!chunks.length) {
+ return {
+ ok: false,
+ error: '전송할 내용이 없어요.'
+ };
+ }
+
+ if (!autoSend) {
+ return telegram_sendMessage(
+ chunks.join(''),
+ false
+ );
+ }
+
+ let result = null;
+
+ for (
+ let index = 0;
+ index < chunks.length;
+ index += 1
+ ) {
+ result =
+ await telegram_sendMessage(
+ chunks[index],
+ true
+ );
+
+ if (!result?.ok) {
+ return result;
+ }
+ }
+
+ return result;
 }
 
 // ────────────────────────────────────────
@@ -2473,6 +4552,11 @@ const PANEL_STYLES = `
     }
     #ctb-status.ok  { color: #4ade80; }
     #ctb-status.err { color: #f87171; }
+    .ctb-runtime-build {
+      position: absolute; right: 4px; bottom: 1px;
+      font-size: 7px; line-height: 1; color: #555577;
+      pointer-events: none;
+    }
     #ctb-token-counter {
       position: absolute; font-size: 10px; color: #888;
       pointer-events: none; z-index: 99998; background: transparent; transition: color 0.2s;
@@ -2527,121 +4611,390 @@ function clampPanelPosition(panel, left, top) {
  };
 }
 
-function savePanelPosition(panel, storageKey) {
- if (!panel || !storageKey) return;
-
- const currentLeft = parseInt(panel.style.left, 10);
- const currentTop = parseInt(panel.style.top, 10);
- const clamped = clampPanelPosition(panel, currentLeft, currentTop);
-
- panel.style.right = 'auto';
- panel.style.bottom = 'auto';
- panel.style.left = clamped.left + 'px';
- panel.style.top = clamped.top + 'px';
-
- chrome.storage.local.set({
- [storageKey]: {
- left: clamped.left,
- top: clamped.top
- }
- });
-}
-
-function applyStoredPanelPosition(panel, storageKey, pos) {
- if (!panel || !pos) return;
-
- setTimeout(function() {
- const clamped = clampPanelPosition(panel, pos.left, pos.top);
-
- panel.style.right = 'auto';
- panel.style.bottom = 'auto';
- panel.style.left = clamped.left + 'px';
- panel.style.top = clamped.top + 'px';
-
- if (
- storageKey &&
- (Number(pos.left) !== clamped.left || Number(pos.top) !== clamped.top)
- ) {chrome.storage.local.set({
- [storageKey]: {
- left: clamped.left,
- top: clamped.top
- }
- });
- }
- }, 0);
-}
-
-function makeDraggable(panel, handleSelector, storageKey) {
- const handle = panel.querySelector(handleSelector);
- if (!handle) return;
-
- let dragging = false;
- let dragX = 0;
- let dragY = 0;
-
- handle.addEventListener('mousedown', (e) => {
- dragging = true;
- dragX = e.clientX - panel.getBoundingClientRect().left;
- dragY = e.clientY - panel.getBoundingClientRect().top;
- panel.style.right = 'auto';
- panel.style.bottom = 'auto';
- panel.dataset.pinned = 'false';
- e.preventDefault();
- });
-
- document.addEventListener('mousemove', (e) => {
- if (!dragging) return;
-
- const clamped = clampPanelPosition(panel, e.clientX - dragX, e.clientY - dragY);
-
- panel.style.left = clamped.left + 'px';
- panel.style.top = clamped.top + 'px';
- });
-
- document.addEventListener('mouseup', () => {
- if (!dragging) return;
-
- dragging = false;
- savePanelPosition(panel, storageKey);
- });
-
- window.addEventListener('resize', function() {
- savePanelPosition(panel, storageKey);
- });
-}
-
-function copyPanelPosition(fromPanel, toPanel, storageKey) {
-  if (!fromPanel || !toPanel || fromPanel === toPanel) return;
-
-  const rect = fromPanel.getBoundingClientRect();
-
-  let left = parseInt(fromPanel.style.left, 10);
-  let top = parseInt(fromPanel.style.top, 10);
-
-  if (!Number.isFinite(left)) {
-    left = Math.round(rect.left);
+function applyPreferredPanelPosition(panel) {
+  if (
+    !panel ||
+    !panel.isConnected
+  ) {
+    return;
   }
 
-  if (!Number.isFinite(top)) {
-    top = Math.round(rect.top);
+  if (
+    getComputedStyle(panel)
+      .display === 'none'
+  ) {
+    return;
   }
 
-  if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+  const preferred =
+    panel.__ctbPreferredPosition;
 
-  const clamped = clampPanelPosition(toPanel, left, top);
-  left = clamped.left;
-  top = clamped.top;
+  if (
+    !preferred ||
+    !Number.isFinite(
+      Number(preferred.left)
+    ) ||
+    !Number.isFinite(
+      Number(preferred.top)
+    )
+  ) {
+    return;
+  }
+
+  const clamped =
+    clampPanelPosition(
+      panel,
+      preferred.left,
+      preferred.top
+    );
+
+  panel.style.right = 'auto';
+  panel.style.bottom = 'auto';
+  panel.style.left =
+    clamped.left + 'px';
+  panel.style.top =
+    clamped.top + 'px';
+}
+
+function savePanelPosition(
+  panel,
+  storageKey
+) {
+  if (
+    !panel ||
+    !storageKey ||
+    !panel.isConnected
+  ) {
+    return;
+  }
+
+  if (
+    getComputedStyle(panel)
+      .display === 'none'
+  ) {
+    return;
+  }
+
+  const rect =
+    panel.getBoundingClientRect();
+
+  if (
+    rect.width <= 0 ||
+    rect.height <= 0
+  ) {
+    return;
+  }
+
+  const clamped =
+    clampPanelPosition(
+      panel,
+      rect.left,
+      rect.top
+    );
+
+  const preferred = {
+    left: clamped.left,
+    top: clamped.top
+  };
+
+  panel.__ctbPreferredPosition =
+    preferred;
+
+  panel.style.right = 'auto';
+  panel.style.bottom = 'auto';
+  panel.style.left =
+    preferred.left + 'px';
+  panel.style.top =
+    preferred.top + 'px';
+
+  chrome.storage.local.set({
+    [storageKey]:
+      preferred
+  });
+}
+
+function applyStoredPanelPosition(
+  panel,
+  storageKey,
+  pos
+) {
+  if (
+    !panel ||
+    !pos
+  ) {
+    return;
+  }
+
+  const left =
+    Number(pos.left);
+
+  const top =
+    Number(pos.top);
+
+  if (
+    !Number.isFinite(left) ||
+    !Number.isFinite(top)
+  ) {
+    return;
+  }
+
+  const preferred = {
+    left: Math.round(left),
+    top: Math.round(top)
+  };
+
+  panel.__ctbPreferredPosition =
+    preferred;
+
+  panel.style.right = 'auto';
+  panel.style.bottom = 'auto';
+  panel.style.left =
+    preferred.left + 'px';
+  panel.style.top =
+    preferred.top + 'px';
+
+  requestAnimationFrame(function() {
+    applyPreferredPanelPosition(
+      panel
+    );
+  });
+}
+
+function normalizePanelUiState(state) {
+  if (
+    state === 'minimized' ||
+    state === 'closed'
+  ) {
+    return state;
+  }
+
+  return 'normal';
+}
+
+function syncPanelDisplay(panel) {
+  if (!panel) {
+    return;
+  }
+
+  const routeVisible =
+    panel.dataset.ctbRouteVisible ===
+    'true';
+
+  const uiState =
+    normalizePanelUiState(
+      panel.dataset.ctbUiState
+    );
+
+  if (
+    !routeVisible ||
+    uiState === 'closed'
+  ) {
+    panel.style.display = 'none';
+    return;
+  }
+
+  panel.style.display =
+    uiState === 'minimized'
+      ? 'flex'
+      : '';
+
+  requestAnimationFrame(function() {
+    applyPreferredPanelPosition(
+      panel
+    );
+  });
+}
+
+function setPanelUiState(
+  panel,
+  storageKey,
+  state,
+  persist
+) {
+  if (!panel) {
+    return;
+  }
+
+  const nextState =
+    normalizePanelUiState(
+      state
+    );
+
+  panel.dataset.ctbUiState =
+    nextState;
+
+  if (
+    typeof panel.__ctbApplyVisualState ===
+    'function'
+  ) {
+    panel.__ctbApplyVisualState(
+      nextState
+    );
+  }
+
+  syncPanelDisplay(
+    panel
+  );
+
+  if (
+    persist &&
+    storageKey
+  ) {
+    chrome.storage.local.set({
+      [storageKey]:
+        nextState
+    });
+  }
+}
+
+function makeDraggable(
+  panel,
+  handleSelector,
+  storageKey
+) {
+  const handle =
+    panel.querySelector(
+      handleSelector
+    );
+
+  if (!handle) {
+    return;
+  }
+
+  let dragging = false;
+  let dragX = 0;
+  let dragY = 0;
+
+  handle.addEventListener(
+    'mousedown',
+    function(e) {
+      if (
+        panel.dataset.ctbUiState ===
+        'minimized'
+      ) {
+        return;
+      }
+
+      dragging = true;
+
+      const rect =
+        panel.getBoundingClientRect();
+
+      dragX =
+        e.clientX - rect.left;
+
+      dragY =
+        e.clientY - rect.top;
+
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+
+      e.preventDefault();
+    }
+  );
+
+  document.addEventListener(
+    'mousemove',
+    function(e) {
+      if (!dragging) {
+        return;
+      }
+
+      const clamped =
+        clampPanelPosition(
+          panel,
+          e.clientX - dragX,
+          e.clientY - dragY
+        );
+
+      panel.style.left =
+        clamped.left + 'px';
+
+      panel.style.top =
+        clamped.top + 'px';
+    }
+  );
+
+  document.addEventListener(
+    'mouseup',
+    function() {
+      if (!dragging) {
+        return;
+      }
+
+      dragging = false;
+
+      savePanelPosition(
+        panel,
+        storageKey
+      );
+    }
+  );
+
+  window.addEventListener(
+    'resize',
+    function() {
+      requestAnimationFrame(
+        function() {
+          applyPreferredPanelPosition(
+            panel
+          );
+        }
+      );
+    }
+  );
+}
+
+function copyPanelPosition(
+  fromPanel,
+  toPanel,
+  storageKey
+) {
+  if (
+    !fromPanel ||
+    !toPanel ||
+    fromPanel === toPanel
+  ) {
+    return;
+  }
+
+  const rect =
+    fromPanel.getBoundingClientRect();
+
+  if (
+    !Number.isFinite(rect.left) ||
+    !Number.isFinite(rect.top)
+  ) {
+    return;
+  }
+
+  const preferred = {
+    left: Math.round(rect.left),
+    top: Math.round(rect.top)
+  };
+
+  toPanel.__ctbPreferredPosition =
+    preferred;
 
   toPanel.style.right = 'auto';
   toPanel.style.bottom = 'auto';
-  toPanel.style.left = left + 'px';
-  toPanel.style.top = top + 'px';
+  toPanel.style.left =
+    preferred.left + 'px';
+  toPanel.style.top =
+    preferred.top + 'px';
 
   if (storageKey) {
     chrome.storage.local.set({
-      [storageKey]: { left: left, top: top }
+      [storageKey]:
+        preferred
     });
   }
+
+  requestAnimationFrame(function() {
+    applyPreferredPanelPosition(
+      toPanel
+    );
+  });
 }
 
 function setPanelStatus(statusEl, msg, type = '') {
@@ -2760,63 +5113,219 @@ function injectAIWidget() {
       <button id="ctb-ai-switch" class="ctb-switch-btn">🔁 위젯 전환</button>
       <div id="ctb-status"></div>
     </div>
+    <span class="ctb-runtime-build">${CTB_RUNTIME_BUILD}</span>
   `;
 
   document.body.appendChild(panel);
 
-  // ── 위치 복원 ──
-  chrome.storage.local.get(['widgetPos_ai'], (res) => {
-    if (res?.widgetPos_ai) {
-      applyStoredPanelPosition(panel, 'widgetPos_ai', res.widgetPos_ai);
-    }
-  });
+  panel.dataset.ctbUiState =
+    'normal';
 
-  makeDraggable(panel, '#ctb-ai-title', 'widgetPos_ai');
+  panel.dataset.ctbRouteVisible =
+    'false';
+
+  makeDraggable(
+    panel,
+    '#ctb-ai-title',
+    'widgetPos_ai'
+  );
 
   // ── 최소화/복원 ──
   let isMinimized = false;
-  const bodyEl = panel.querySelector('#ctb-body');
-  const controlsEl = panel.querySelector('#ctb-ai-controls');
-  const titleTextEl = panel.querySelector('#ctb-ai-title-text');
 
-  function minimize() {
+  const bodyEl =
+    panel.querySelector(
+      '#ctb-body'
+    );
+
+  const controlsEl =
+    panel.querySelector(
+      '#ctb-ai-controls'
+    );
+
+  const titleTextEl =
+    panel.querySelector(
+      '#ctb-ai-title-text'
+    );
+
+  const titleEl =
+    panel.querySelector(
+      '#ctb-ai-title'
+    );
+
+  function applyAIMinimizedVisual() {
     isMinimized = true;
-    bodyEl.style.display = 'none';
-    controlsEl.style.display = 'none';
-    panel.style.width = '36px'; panel.style.height = '36px';
-    panel.style.borderRadius = '50%'; panel.style.padding = '0';
-    panel.style.display = 'flex'; panel.style.justifyContent = 'center'; panel.style.alignItems = 'center';
-    panel.style.cursor = 'pointer';
-    panel.querySelector('#ctb-ai-title').style.marginBottom = '0';
-    panel.querySelector('#ctb-ai-title').style.cursor = 'pointer';
-    titleTextEl.style.fontSize = '18px';
-    titleTextEl.textContent = '🔗';
+
+    bodyEl.style.display =
+      'none';
+
+    controlsEl.style.display =
+      'none';
+
+    panel.style.setProperty(
+      'width',
+      '36px',
+      'important'
+    );
+
+    panel.style.height =
+      '36px';
+
+    panel.style.setProperty(
+      'border-radius',
+      '50%',
+      'important'
+    );
+
+    panel.style.setProperty(
+      'padding',
+      '0',
+      'important'
+    );
+
+    panel.style.justifyContent =
+      'center';
+
+    panel.style.alignItems =
+      'center';
+
+    panel.style.cursor =
+      'pointer';
+
+    titleEl.style.marginBottom =
+      '0';
+
+    titleEl.style.cursor =
+      'pointer';
+
+    titleTextEl.style.fontSize =
+      '18px';
+
+    titleTextEl.textContent =
+      '🔗';
   }
 
-  function restore() {
+  function applyAINormalVisual() {
     isMinimized = false;
-    bodyEl.style.display = '';
-    controlsEl.style.display = '';
-    panel.style.width = '110px'; panel.style.height = '';
-    panel.style.borderRadius = '12px'; panel.style.padding = '9px 10px';
-    panel.style.display = ''; panel.style.justifyContent = ''; panel.style.alignItems = '';
-    panel.style.cursor = '';
-    panel.querySelector('#ctb-ai-title').style.marginBottom = '7px';
-    panel.querySelector('#ctb-ai-title').style.cursor = 'grab';
-    titleTextEl.style.fontSize = '10px';
-    titleTextEl.textContent = '🔗 → Telegram';
+
+    bodyEl.style.display =
+      '';
+
+    controlsEl.style.display =
+      '';
+
+    panel.style.setProperty(
+      'width',
+      '110px',
+      'important'
+    );
+
+    panel.style.height =
+      '';
+
+    panel.style.setProperty(
+      'border-radius',
+      '12px',
+      'important'
+    );
+
+    panel.style.setProperty(
+      'padding',
+      '9px 10px',
+      'important'
+    );
+
+    panel.style.justifyContent =
+      '';
+
+    panel.style.alignItems =
+      '';
+
+    panel.style.cursor =
+      '';
+
+    titleEl.style.marginBottom =
+      '7px';
+
+    titleEl.style.cursor =
+      'grab';
+
+    titleTextEl.style.fontSize =
+      '10px';
+
+    titleTextEl.textContent =
+      '🔗 → Telegram';
   }
 
-  panel.querySelector('#ctb-ai-minimize').addEventListener('click', (e) => { e.stopPropagation(); minimize(); });
-    panel.querySelector('#ctb-ai-refresh').addEventListener('click', (e) => {
+  panel.__ctbApplyVisualState =
+    function(state) {
+      if (state === 'minimized') {
+        applyAIMinimizedVisual();
+      } else {
+        applyAINormalVisual();
+      }
+    };
+
+  panel
+    .querySelector(
+      '#ctb-ai-minimize'
+    )
+    .addEventListener(
+      'click',
+      function(e) {
+        e.stopPropagation();
+
+        setPanelUiState(
+          panel,
+          'widgetUiState_ai',
+          'minimized',
+          true
+        );
+      }
+    );
+
+  panel.querySelector('#ctb-ai-refresh').addEventListener('click', (e) => {
     e.stopPropagation();
     runBridgeRefreshHandler('aiSource', function() {
       syncBridgeTargetPickerVisibility();
       setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok');
     });
   });
-  panel.addEventListener('click', () => { if (isMinimized) restore(); });
-  panel.querySelector('#ctb-ai-close').addEventListener('click', (e) => { e.stopPropagation(); panel.style.display = 'none'; });
+
+  panel.addEventListener(
+    'click',
+    function() {
+      if (
+        panel.dataset.ctbUiState ===
+        'minimized'
+      ) {
+        setPanelUiState(
+          panel,
+          'widgetUiState_ai',
+          'normal',
+          true
+        );
+      }
+    }
+  );
+
+  panel
+    .querySelector(
+      '#ctb-ai-close'
+    )
+    .addEventListener(
+      'click',
+      function(e) {
+        e.stopPropagation();
+
+        setPanelUiState(
+          panel,
+          'widgetUiState_ai',
+          'closed',
+          true
+        );
+      }
+    );
 
   // ── 복사 모드 토글 ──
   const modFullBtn = panel.querySelector('#ctb-ai-mode-full');
@@ -2882,19 +5391,172 @@ function injectAIWidget() {
     return yy + '.' + mm + '.' + dd + ' ' + hh + ':' + mi;
   }
 
+  const DEEPSEEK_CHINA_PUBLIC_HOLIDAYS_2026 =
+    new Set([
+      '2026-01-01',
+      '2026-01-02',
+      '2026-01-03',
+
+      '2026-02-15',
+      '2026-02-16',
+      '2026-02-17',
+      '2026-02-18',
+      '2026-02-19',
+      '2026-02-20',
+      '2026-02-21',
+      '2026-02-22',
+      '2026-02-23',
+
+      '2026-04-04',
+      '2026-04-05',
+      '2026-04-06',
+
+      '2026-05-01',
+      '2026-05-02',
+      '2026-05-03',
+      '2026-05-04',
+      '2026-05-05',
+
+      '2026-06-19',
+      '2026-06-20',
+      '2026-06-21',
+
+      '2026-09-25',
+      '2026-09-26',
+      '2026-09-27',
+
+      '2026-10-01',
+      '2026-10-02',
+      '2026-10-03',
+      '2026-10-04',
+      '2026-10-05',
+      '2026-10-06',
+      '2026-10-07'
+    ]);
+
+  function getDeepSeekChinaDateInfo(now) {
+    const formatter =
+      new Intl.DateTimeFormat(
+        'en-CA',
+        {
+          timeZone: 'Asia/Shanghai',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          weekday: 'short'
+        }
+      );
+
+    const values = {};
+
+    formatter
+      .formatToParts(now)
+      .forEach(function(part) {
+        if (
+          part.type !== 'literal'
+        ) {
+          values[part.type] =
+            part.value;
+        }
+      });
+
+    return {
+      dateKey:
+        values.year +
+        '-' +
+        values.month +
+        '-' +
+        values.day,
+      weekday:
+        values.weekday || ''
+    };
+  }
+
+  function getDeepSeekPeakStateNow() {
+    const now =
+      new Date();
+
+    const china =
+      getDeepSeekChinaDateInfo(
+        now
+      );
+
+    const isWeekend =
+      china.weekday === 'Sat' ||
+      china.weekday === 'Sun';
+
+    if (isWeekend) {
+      return {
+        isPeak: false,
+        reason: '주말'
+      };
+    }
+
+    if (
+      DEEPSEEK_CHINA_PUBLIC_HOLIDAYS_2026
+        .has(china.dateKey)
+    ) {
+      return {
+        isPeak: false,
+        reason: '중국 공휴일'
+      };
+    }
+
+    const utcHour =
+      now.getUTCHours();
+
+    const isPeak =
+      (
+        utcHour >= 1 &&
+        utcHour < 4
+      ) ||
+      (
+        utcHour >= 6 &&
+        utcHour < 10
+      );
+
+    return {
+      isPeak: isPeak,
+      reason:
+        isPeak
+          ? '피크 시간'
+          : '일반 시간'
+    };
+  }
+
   function isDeepSeekPeakHourNow() {
-    const now = new Date();
-    const utcHour = now.getUTCHours();
-    return (utcHour >= 1 && utcHour < 4) || (utcHour >= 6 && utcHour < 10);
+    return (
+      getDeepSeekPeakStateNow()
+        .isPeak
+    );
   }
 
   function applyDeepSeekPeakStyle() {
-    const row = panel.querySelector('#ctb-deepseek-balance-row');
-    if (!row) return;
-    const isPeak = isDeepSeekPeakHourNow();
-    row.classList.toggle('ctb-deepseek-peak', isPeak);
-    const peakTitle = 'DeepSeek 피크 시간: UTC 01:00-04:00 / 06:00-10:00';
-    row.title = isPeak ? peakTitle : 'DeepSeek 일반 시간';
+    const row =
+      panel.querySelector(
+        '#ctb-deepseek-balance-row'
+      );
+
+    if (!row) {
+      return;
+    }
+
+    const peakState =
+      getDeepSeekPeakStateNow();
+
+    row.classList.toggle(
+      'ctb-deepseek-peak',
+      peakState.isPeak
+    );
+
+    if (peakState.isPeak) {
+      row.title =
+        'DeepSeek 피크: 월-금 UTC 01:00-04:00 / 06:00-10:00';
+    } else {
+      row.title =
+        'DeepSeek 오프피크: ' +
+        peakState.reason;
+    }
   }
 
   function clampDeepSeekUsageIndex() {
@@ -3036,10 +5698,7 @@ function injectAIWidget() {
   const isCurrentPageAI = SITE === 'chatgpt' || SITE === 'claude' || SITE === 'gemini';
   const applyAISource = function(tabInfo) {
     aiSourceTarget = tabInfo;
-    var siteName = tabInfo ? (tabInfo.siteName || 'AI') : 'AI';
-    btn1.textContent = '\u{1F4E4} \u2192 Telegram';
-    btn1.style.background = tabInfo && AI_SOURCE_COLORS[tabInfo.site] ? AI_SOURCE_COLORS[tabInfo.site] : '#2AABEE';
-    btn1.title = tabInfo ? siteName + ' - ' + tabInfo.title : '';
+    renderTelegramQueueButton();
   };
 
   function getSelectedAISourceTabId() {
@@ -3125,6 +5784,12 @@ function injectAIWidget() {
   refreshAiSourceTabs();
   registerBridgeRefreshHandler('aiSource', refreshAiSourceTabs);
   aiSourceSelect.addEventListener('change', function() {
+    if (telegramSendQueued) {
+      cancelTelegramSendQueue(
+        '예약 취소 · AI 대상 변경'
+      );
+    }
+
     const selected = this.options[this.selectedIndex];
 
     if (selected && selected.value) {
@@ -3150,18 +5815,353 @@ function injectAIWidget() {
   const setStatus = (msg, type) => setPanelStatus(statusEl, msg, type);
   const setBtnsDisabled = (v) => setPanelBtnsDisabled([btn1], v);
 
-  // ── AI → Telegram ──
-  btn1.addEventListener('click', () => {
-    const autoSend = autoCheck.checked;
+  let telegramSendQueued = false;
+  let telegramSendQueueSending = false;
+  let telegramSendQueueTargetTabId = null;
+  let telegramSendQueueAutoSend = true;
+
+  function renderTelegramQueueButton() {
+    if (telegramSendQueued) {
+      btn1.textContent = '⏱ Telegram 예약중';
+
+      btn1.style.setProperty(
+        'background',
+        '#FFFFFF',
+        'important'
+      );
+
+      btn1.style.setProperty(
+        'color',
+        '#2AABEE',
+        'important'
+      );
+
+      btn1.style.setProperty(
+        'border',
+        '1px solid #2AABEE',
+        'important'
+      );
+
+      btn1.title =
+        'AI 응답 완료 후 Telegram으로 자동 전송합니다. 다시 누르면 예약을 취소합니다.';
+
+      return;
+    }
+
+    btn1.textContent = '📤 → Telegram';
+
+    btn1.style.removeProperty('background');
+    btn1.style.removeProperty('color');
+    btn1.style.removeProperty('border');
+
+    if (aiSourceTarget) {
+      btn1.title =
+        (aiSourceTarget.siteName || 'AI') +
+        ' - ' +
+        (aiSourceTarget.title || '');
+    } else {
+      btn1.title = '';
+    }
+  }
+
+  function cancelTelegramSendQueue(message) {
+    if (!telegramSendQueued) {
+      return;
+    }
+
+    telegramSendQueued = false;
+    telegramSendQueueSending = false;
+    telegramSendQueueTargetTabId = null;
+
+    renderTelegramQueueButton();
+
+    if (message) {
+      setStatus(message, 'ok');
+    }
+  }
+
+  function queueTelegramSend(
+    targetTabId,
+    autoSend
+  ) {
+    telegramSendQueued = true;
+    telegramSendQueueSending = false;
+
+    telegramSendQueueTargetTabId =
+      targetTabId
+        ? Number(targetTabId)
+        : null;
+
+    telegramSendQueueAutoSend =
+      !!autoSend;
+
+    renderTelegramQueueButton();
+
+    setStatus(
+      '⏱ Telegram 전송 예약됨'
+    );
+  }
+
+  function sendAiResponseToTelegram(options) {
+    const opts = options || {};
+
+    const targetTabId =
+      Object.prototype.hasOwnProperty.call(
+        opts,
+        'targetTabId'
+      )
+        ? opts.targetTabId
+        : (
+            isCurrentPageAI
+              ? null
+              : getSelectedAISourceTabId()
+          );
+
+    const autoSend =
+      Object.prototype.hasOwnProperty.call(
+        opts,
+        'autoSend'
+      )
+        ? !!opts.autoSend
+        : autoCheck.checked;
+
+    const queued = !!opts.queued;
+
+    if (queued) {
+      if (
+        !telegramSendQueued ||
+        telegramSendQueueSending
+      ) {
+        return;
+      }
+
+      telegramSendQueueSending = true;
+    }
+
     setBtnsDisabled(true);
-    setStatus('⏳ 처리 중...');
-    chrome.runtime.sendMessage({ action: 'aiToTelegram', autoSend, targetTabId: isCurrentPageAI ? null : (aiSourceTarget ? aiSourceTarget.id : null) }, (res) => {
-      setBtnsDisabled(false);
-      if (chrome.runtime.lastError) { setStatus(`❌ ${chrome.runtime.lastError.message}`, 'err'); return; }
-      if (res?.ok) setStatus('✅ Telegram 전송!', 'ok');
-      else         setStatus(`❌ ${res?.error || '실패'}`, 'err');
-    });
-  });
+
+    setStatus(
+      queued
+        ? '⏳ 예약 전송 중...'
+        : '⏳ 처리 중...'
+    );
+
+    chrome.runtime.sendMessage(
+      {
+        action: 'aiToTelegram',
+        autoSend: autoSend,
+        targetTabId: targetTabId
+      },
+      function(res) {
+        setBtnsDisabled(false);
+
+        const runtimeError =
+          chrome.runtime.lastError;
+
+        if (queued) {
+          telegramSendQueueSending = false;
+        }
+
+        if (runtimeError) {
+          if (queued) {
+            telegramSendQueued = false;
+            telegramSendQueueTargetTabId = null;
+            renderTelegramQueueButton();
+          }
+
+          setStatus(
+            '❌ ' + runtimeError.message,
+            'err'
+          );
+
+          return;
+        }
+
+        if (res?.ok) {
+          if (queued) {
+            telegramSendQueued = false;
+            telegramSendQueueTargetTabId = null;
+            renderTelegramQueueButton();
+          }
+
+          setStatus(
+            queued
+              ? '✅ 예약 Telegram 전송!'
+              : '✅ Telegram 전송!',
+            'ok'
+          );
+
+          return;
+        }
+
+        const errorMessage =
+          res?.error || '실패';
+
+        const displayedError =
+          SITE === 'chatgpt' &&
+          /AI 응답을 찾을 수 없어요/.test(
+            errorMessage
+          ) &&
+          window.__ctbLastResponseDiagnostic
+            ? window.__ctbLastResponseDiagnostic
+            : errorMessage;
+
+        if (
+          queued &&
+          telegramSendQueued &&
+          /아직\s*답변\s*중/.test(
+            errorMessage
+          )
+        ) {
+          setStatus(
+            '⏱ 완료 확인 중...'
+          );
+
+          setTimeout(
+            function() {
+              if (
+                !telegramSendQueued ||
+                telegramSendQueueSending
+              ) {
+                return;
+              }
+
+              sendAiResponseToTelegram({
+                queued: true,
+                targetTabId:
+                  telegramSendQueueTargetTabId,
+                autoSend:
+                  telegramSendQueueAutoSend
+              });
+            },
+            1500
+          );
+
+          return;
+        }
+
+        if (queued) {
+          telegramSendQueued = false;
+          telegramSendQueueTargetTabId = null;
+          renderTelegramQueueButton();
+        }
+
+      setStatus(
+        '❌ ' + displayedError,
+        'err'
+      );
+      }
+    );
+  }
+
+  // ── AI → Telegram ──
+  btn1.addEventListener(
+    'click',
+    function() {
+      if (telegramSendQueued) {
+        cancelTelegramSendQueue(
+          '예약 취소됨'
+        );
+
+        return;
+      }
+
+      const autoSend =
+        autoCheck.checked;
+
+      const targetTabId =
+        isCurrentPageAI
+          ? null
+          : getSelectedAISourceTabId();
+
+      if (isCurrentPageAI) {
+        let currentlyStreaming =
+          _streaming;
+
+        try {
+          currentlyStreaming =
+            !!isStreaming();
+        } catch (e) {
+          currentlyStreaming =
+            _streaming;
+        }
+
+        if (currentlyStreaming) {
+          queueTelegramSend(
+            null,
+            autoSend
+          );
+
+          return;
+        }
+
+        sendAiResponseToTelegram({
+          targetTabId: null,
+          autoSend: autoSend,
+          queued: false
+        });
+
+        return;
+      }
+
+      setBtnsDisabled(true);
+
+      setStatus(
+        '⏳ 상태 확인 중...'
+      );
+
+      chrome.runtime.sendMessage(
+        {
+          action: 'checkAiTabStreaming',
+          targetTabId: targetTabId
+        },
+        function(res) {
+          setBtnsDisabled(false);
+
+          const runtimeError =
+            chrome.runtime.lastError;
+
+          if (runtimeError) {
+            setStatus(
+              '❌ ' +
+              runtimeError.message,
+              'err'
+            );
+
+            return;
+          }
+
+          if (!res || !res.ok) {
+            setStatus(
+              '❌ ' +
+              (
+                res?.error ||
+                'AI 상태를 확인할 수 없어요.'
+              ),
+              'err'
+            );
+
+            return;
+          }
+
+          if (res.streaming) {
+            queueTelegramSend(
+              targetTabId,
+              autoSend
+            );
+
+            return;
+          }
+
+          sendAiResponseToTelegram({
+            targetTabId: targetTabId,
+            autoSend: autoSend,
+            queued: false
+          });
+        }
+      );
+    }
+  );
 
   // ── 위젯 스위치 ──
   panel.querySelector('#ctb-ai-switch').addEventListener('click', (e) => {
@@ -3180,14 +6180,34 @@ function injectAIWidget() {
     _streaming = streaming;
 
     if (streaming) {
-      setStatus('\u23F3 \uC791\uC131 \uC911...');
+      if (telegramSendQueued) {
+        setStatus(
+          '⏱ Telegram 전송 예약됨'
+        );
+      } else {
+        setStatus(
+          '⏳ 작성 중...'
+        );
+      }
+
       panel.style.background = '#ffffff';
       panel.style.borderColor = '#d0d0d0';
-    } else {
-      setStatus('\u2705 \uC644\uB8CC');
-      panel.style.background = '#1a1a2e';
-      panel.style.borderColor = '#3a3a5c';
+
+      return;
     }
+
+    if (telegramSendQueued) {
+      setStatus(
+        '⏳ 예약 전송 준비...'
+      );
+    } else {
+      setStatus(
+        '✅ 완료'
+      );
+    }
+
+    panel.style.background = '#1a1a2e';
+    panel.style.borderColor = '#3a3a5c';
   }
 
   function updateStreamingState(streaming) {
@@ -3249,6 +6269,37 @@ function injectAIWidget() {
           });
         }, 350);
       }
+
+      if (
+        telegramSendQueued &&
+        !telegramSendQueueSending
+      ) {
+        const queuedTargetTabId =
+          telegramSendQueueTargetTabId;
+
+        const queuedAutoSend =
+          telegramSendQueueAutoSend;
+
+        setTimeout(
+          function() {
+            if (
+              !telegramSendQueued ||
+              telegramSendQueueSending
+            ) {
+              return;
+            }
+
+            sendAiResponseToTelegram({
+              queued: true,
+              targetTabId:
+                queuedTargetTabId,
+              autoSend:
+                queuedAutoSend
+            });
+          },
+          350
+        );
+      }
     }
   }
 
@@ -3267,7 +6318,11 @@ function injectAIWidget() {
     if (_streamingCheckBusy) return;
     _streamingCheckBusy = true;
 
-    var selectedAiTabId = getSelectedAISourceTabId();
+    var selectedAiTabId =
+      telegramSendQueued &&
+      telegramSendQueueTargetTabId
+        ? telegramSendQueueTargetTabId
+        : getSelectedAISourceTabId();
     console.log('[AI-STREAM-REMOTE] selectedAiTabId=', selectedAiTabId, 'aiSourceTarget=', aiSourceTarget ? aiSourceTarget.id : null);
 
     try {
@@ -3343,54 +6398,177 @@ function injectTGWidget() {
       <button id="ctb-tg-switch" class="ctb-switch-btn">🔁 위젯 전환</button>
       <div id="ctb-status"></div>
     </div>
+    <span class="ctb-runtime-build">${CTB_RUNTIME_BUILD}</span>
   `;
 
   document.body.appendChild(panel);
 
-  // ── 위치 복원 ──
-  chrome.storage.local.get(['widgetPos_tg'], (res) => {
-    if (res?.widgetPos_tg) {
-      applyStoredPanelPosition(panel, 'widgetPos_tg', res.widgetPos_tg);
-    }
-  });
+  panel.dataset.ctbUiState =
+    'normal';
 
-  makeDraggable(panel, '#ctb-tg-title', 'widgetPos_tg');
+  panel.dataset.ctbRouteVisible =
+    'false';
+
+  makeDraggable(
+    panel,
+    '#ctb-tg-title',
+    'widgetPos_tg'
+  );
 
   // ── 최소화/복원 ──
   let isMinimized = false;
-  const bodyEl = panel.querySelector('#ctb-body');
-  const controlsEl = panel.querySelector('#ctb-tg-controls');
-  const titleTextEl = panel.querySelector('#ctb-tg-title-text');
 
-  function minimize() {
+  const bodyEl =
+    panel.querySelector(
+      '#ctb-body'
+    );
+
+  const controlsEl =
+    panel.querySelector(
+      '#ctb-tg-controls'
+    );
+
+  const titleTextEl =
+    panel.querySelector(
+      '#ctb-tg-title-text'
+    );
+
+  const titleEl =
+    panel.querySelector(
+      '#ctb-tg-title'
+    );
+
+  function applyTGMinimizedVisual() {
     isMinimized = true;
-    bodyEl.style.display = 'none';
-    controlsEl.style.display = 'none';
-    panel.style.width = '36px'; panel.style.height = '36px';
-    panel.style.borderRadius = '50%'; panel.style.padding = '0';
-    panel.style.display = 'flex'; panel.style.justifyContent = 'center'; panel.style.alignItems = 'center';
-    panel.style.cursor = 'pointer';
-    panel.querySelector('#ctb-tg-title').style.marginBottom = '0';
-    panel.querySelector('#ctb-tg-title').style.cursor = 'pointer';
-    titleTextEl.style.fontSize = '18px';
-    titleTextEl.textContent = '📥';
+
+    bodyEl.style.display =
+      'none';
+
+    controlsEl.style.display =
+      'none';
+
+    panel.style.setProperty(
+      'width',
+      '36px',
+      'important'
+    );
+
+    panel.style.height =
+      '36px';
+
+    panel.style.setProperty(
+      'border-radius',
+      '50%',
+      'important'
+    );
+
+    panel.style.setProperty(
+      'padding',
+      '0',
+      'important'
+    );
+
+    panel.style.justifyContent =
+      'center';
+
+    panel.style.alignItems =
+      'center';
+
+    panel.style.cursor =
+      'pointer';
+
+    titleEl.style.marginBottom =
+      '0';
+
+    titleEl.style.cursor =
+      'pointer';
+
+    titleTextEl.style.fontSize =
+      '18px';
+
+    titleTextEl.textContent =
+      '📥';
   }
 
-  function restore() {
+  function applyTGNormalVisual() {
     isMinimized = false;
-    bodyEl.style.display = '';
-    controlsEl.style.display = '';
-    panel.style.width = '110px'; panel.style.height = '';
-    panel.style.borderRadius = '12px'; panel.style.padding = '9px 10px';
-    panel.style.display = ''; panel.style.justifyContent = ''; panel.style.alignItems = '';
-    panel.style.cursor = '';
-    panel.querySelector('#ctb-tg-title').style.marginBottom = '7px';
-    panel.querySelector('#ctb-tg-title').style.cursor = 'grab';
-    titleTextEl.style.fontSize = '10px';
-    titleTextEl.textContent = '📥 → AI';
+
+    bodyEl.style.display =
+      '';
+
+    controlsEl.style.display =
+      '';
+
+    panel.style.setProperty(
+      'width',
+      '110px',
+      'important'
+    );
+
+    panel.style.height =
+      '';
+
+    panel.style.setProperty(
+      'border-radius',
+      '12px',
+      'important'
+    );
+
+    panel.style.setProperty(
+      'padding',
+      '9px 10px',
+      'important'
+    );
+
+    panel.style.justifyContent =
+      '';
+
+    panel.style.alignItems =
+      '';
+
+    panel.style.cursor =
+      '';
+
+    titleEl.style.marginBottom =
+      '7px';
+
+    titleEl.style.cursor =
+      'grab';
+
+    titleTextEl.style.fontSize =
+      '10px';
+
+    titleTextEl.textContent =
+      '📥 → AI';
   }
 
-  panel.querySelector('#ctb-tg-minimize').addEventListener('click', (e) => { e.stopPropagation(); minimize(); });
+  panel.__ctbApplyVisualState =
+    function(state) {
+      if (state === 'minimized') {
+        applyTGMinimizedVisual();
+      } else {
+        applyTGNormalVisual();
+      }
+    };
+
+  panel
+    .querySelector(
+      '#ctb-tg-minimize'
+    )
+    .addEventListener(
+      'click',
+      function(e) {
+        e.stopPropagation();
+
+        setPanelUiState(
+          panel,
+          'widgetUiState_tg',
+          'minimized',
+          true
+        );
+      }
+    );
+
   panel.querySelector('#ctb-tg-refresh').addEventListener('click', (e) => {
     e.stopPropagation();
     runBridgeRefreshHandler('tgTarget', function() {
@@ -3398,8 +6576,41 @@ function injectTGWidget() {
       setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok');
     });
   });
-  panel.addEventListener('click', () => { if (isMinimized) restore(); });
-  panel.querySelector('#ctb-tg-close').addEventListener('click', (e) => { e.stopPropagation(); panel.style.display = 'none'; });
+
+  panel.addEventListener(
+    'click',
+    function() {
+      if (
+        panel.dataset.ctbUiState ===
+        'minimized'
+      ) {
+        setPanelUiState(
+          panel,
+          'widgetUiState_tg',
+          'normal',
+          true
+        );
+      }
+    }
+  );
+
+  panel
+    .querySelector(
+      '#ctb-tg-close'
+    )
+    .addEventListener(
+      'click',
+      function(e) {
+        e.stopPropagation();
+
+        setPanelUiState(
+          panel,
+          'widgetUiState_tg',
+          'closed',
+          true
+        );
+      }
+    );
 
   // ── AI 탭 동적 선택 ──
   const SITE_COLORS = { chatgpt: '#10A37F', claude: '#D97757', gemini: '#EA4335' };
@@ -3608,7 +6819,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.action === 'sendToTelegram') {
-    telegram_sendMessage(msg.text, msg.autoSend).then(sendResponse);
+    telegram_sendTextChunks(
+      msg.text,
+      msg.autoSend
+    ).then(sendResponse);
     return true;
   }
 });
@@ -3633,6 +6847,41 @@ chrome.storage.onChanged.addListener((changes) => {
   }
   if (changes?.widget_state) {
     applyState(changes.widget_state.newValue || 'normal', true);
+  }
+  if (changes?.widgetUiState_ai) {
+    const aiPanel =
+      document.getElementById(
+        'ctb-ai-panel'
+      );
+
+    if (aiPanel) {
+      setPanelUiState(
+        aiPanel,
+        'widgetUiState_ai',
+        changes.widgetUiState_ai
+          .newValue ||
+          'normal',
+        false
+      );
+    }
+  }
+
+  if (changes?.widgetUiState_tg) {
+    const tgPanel =
+      document.getElementById(
+        'ctb-tg-panel'
+      );
+
+    if (tgPanel) {
+      setPanelUiState(
+        tgPanel,
+        'widgetUiState_tg',
+        changes.widgetUiState_tg
+          .newValue ||
+          'normal',
+        false
+      );
+    }
   }
   console.log('[ONCHANGED] full keys=', JSON.stringify(Object.keys(changes||{})));
 });
@@ -3662,13 +6911,18 @@ function applyState(state, keepPosition) {
     copyPanelPosition(currentPanel, nextPanel, nextStorageKey);
   }
 
-  if (showAI) {
-    ai.style.display = '';
-    tg.style.display = 'none';
-  } else {
-    tg.style.display = '';
-    ai.style.display = 'none';
-  }
+  ai.dataset.ctbRouteVisible =
+    showAI
+      ? 'true'
+      : 'false';
+
+  tg.dataset.ctbRouteVisible =
+    showAI
+      ? 'false'
+      : 'true';
+
+  syncPanelDisplay(ai);
+  syncPanelDisplay(tg);
 
   syncBridgeTargetPickerVisibility();
 }
@@ -3695,10 +6949,74 @@ if (SITE === 'telegram' || SITE) {
     injectTGWidget();
     injectTokenCounter();
 
-    chrome.storage.local.get(['widget_state'], (res) => {
-      console.log('[INIT] widget_state=', res?.widget_state, 'SITE=', SITE);
-      applyState(res?.widget_state || 'normal');
-    });
+    chrome.storage.local.get(
+      [
+        'widget_state',
+        'widgetUiState_ai',
+        'widgetUiState_tg',
+        'widgetPos_ai',
+        'widgetPos_tg'
+      ],
+      function(res) {
+        const aiPanel =
+          document.getElementById(
+            'ctb-ai-panel'
+          );
+
+        const tgPanel =
+          document.getElementById(
+            'ctb-tg-panel'
+          );
+
+        if (aiPanel) {
+          setPanelUiState(
+            aiPanel,
+            'widgetUiState_ai',
+            res?.widgetUiState_ai ||
+              'normal',
+            false
+          );
+
+          if (res?.widgetPos_ai) {
+            applyStoredPanelPosition(
+              aiPanel,
+              'widgetPos_ai',
+              res.widgetPos_ai
+            );
+          }
+        }
+
+        if (tgPanel) {
+          setPanelUiState(
+            tgPanel,
+            'widgetUiState_tg',
+            res?.widgetUiState_tg ||
+              'normal',
+            false
+          );
+
+          if (res?.widgetPos_tg) {
+            applyStoredPanelPosition(
+              tgPanel,
+              'widgetPos_tg',
+              res.widgetPos_tg
+            );
+          }
+        }
+
+        console.log(
+          '[INIT] widget_state=',
+          res?.widget_state,
+          'SITE=',
+          SITE
+        );
+
+        applyState(
+          res?.widget_state ||
+          'normal'
+        );
+      }
+    );
   };
 
   if (document.readyState !== 'loading') { onReady(); }
