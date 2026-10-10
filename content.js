@@ -6,7 +6,7 @@ window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__ = true;
 
 // content.js v5.0
 // Claude, ChatGPT, Gemini, Telegram 범용 지원
-const CTB_RUNTIME_BUILD = '058-15';
+const CTB_RUNTIME_BUILD = '059-12';
 
 console.log(
   '[CTB] content runtime ' +
@@ -2637,7 +2637,7 @@ function telegram_sortCachedMessages() {
 }
 
 function telegram_storeCachedMessage(
- descriptor
+  descriptor
 ) {
  if (
  !descriptor ||
@@ -2670,6 +2670,10 @@ function telegram_storeCachedMessage(
  descriptor.order;
  }
 
+ telegram_notifyRouteIncoming(
+ descriptor
+ );
+
  return;
  }
 
@@ -2688,6 +2692,153 @@ function telegram_storeCachedMessage(
  .nextSequence += 1;
 
  telegram_sortCachedMessages();
+
+ telegram_notifyRouteIncoming(
+ descriptor
+ );
+}
+
+const telegramRouteIncomingKeys =
+ new Set();
+
+function telegram_notifyRouteIncoming(
+ descriptor
+) {
+ if (
+ SITE !== 'telegram' ||
+ !descriptor ||
+ !descriptor.key ||
+ !descriptor.text ||
+ telegramRouteIncomingKeys.has(
+ descriptor.key + ':' +
+ telegram_cacheHashText(descriptor.text)
+ )
+ ) {
+ return;
+ }
+
+ telegramRouteIncomingKeys.add(
+ descriptor.key + ':' +
+ telegram_cacheHashText(descriptor.text)
+ );
+
+ chrome.runtime.sendMessage({
+ action: 'telegramRouteIncoming',
+ chatKey:
+ telegram_getCurrentChatKey(),
+ key: descriptor.key,
+ order: descriptor.order,
+ text: descriptor.text
+ }, function() {
+ void chrome.runtime.lastError;
+ });
+}
+
+function telegram_getRouteContext() {
+ const bubbles =
+ Array.from(
+ document.querySelectorAll('.bubble')
+ ).filter(
+ telegram_cacheIsVisibleBubble
+ );
+
+ const bubble =
+ bubbles.length
+ ? bubbles[bubbles.length - 1]
+ : null;
+
+ const routeRoot =
+ telegram_findMessageRoot();
+ const allBubbles =
+ routeRoot
+ ? Array.from(
+ routeRoot.querySelectorAll('.bubble')
+ )
+ : bubbles;
+ const bubbleIndex =
+ bubble ? allBubbles.indexOf(bubble) : -1;
+
+ const descriptor =
+ bubble
+ ? telegram_cacheBubbleDescriptor(
+ bubble,
+ telegram_cacheIsOutgoingBubble(bubble)
+ ? 'out'
+ : 'in'
+ )
+ : null;
+
+ return {
+ chatKey:
+ telegram_getCurrentChatKey(),
+ anchorKey:
+ descriptor?.key || '',
+ anchorOrder:
+ typeof descriptor?.order === 'number'
+ ? descriptor.order
+ : (
+ bubbleIndex >= 0
+ ? bubbleIndex
+ : null
+ )
+ };
+}
+
+let telegramRouteReconcileTimer = null;
+
+function telegram_reconcileRouteMessages() {
+ if (SITE !== 'telegram') return;
+
+ const chatKey =
+ telegram_getCurrentChatKey();
+ const root =
+ telegram_findMessageRoot();
+
+ if (!chatKey || !root) return;
+
+ const messages = [];
+ const bubbles =
+ Array.from(root.querySelectorAll('.bubble'));
+
+ bubbles.forEach(function(bubble, domIndex) {
+ if (telegram_cacheIsOutgoingBubble(bubble)) return;
+
+ const descriptor =
+ telegram_cacheBubbleDescriptor(bubble, 'in');
+
+ if (!descriptor.key || !descriptor.text) return;
+
+ messages.push({
+ key: descriptor.key,
+ order:
+ typeof descriptor.order === 'number'
+ ? descriptor.order
+ : domIndex,
+ text: descriptor.text
+ });
+ });
+
+ if (!messages.length) return;
+
+ chrome.runtime.sendMessage({
+ action: 'telegramRouteReconcile',
+ chatKey: chatKey,
+ messages: messages
+ }, function() {
+ void chrome.runtime.lastError;
+ });
+}
+
+function telegram_queueRouteReconciliation() {
+ if (telegramRouteReconcileTimer) {
+ clearTimeout(telegramRouteReconcileTimer);
+ }
+
+ telegramRouteReconcileTimer =
+ setTimeout(function() {
+ telegramRouteReconcileTimer = null;
+ telegram_reconcileRouteMessages();
+ }, 250);
 }
 
 function telegram_captureAnswerBatch() {
@@ -2813,6 +2964,7 @@ function telegram_queueAnswerBatchCapture() {
  false;
 
  telegram_captureAnswerBatch();
+ telegram_queueRouteReconciliation();
  });
 }
 
@@ -2830,6 +2982,7 @@ function telegram_ensureAnswerBatchObserver() {
  telegramAnswerBatchCache.observer
  ) {
  telegram_captureAnswerBatch();
+ telegram_queueRouteReconciliation();
  return;
  }
 
@@ -2860,6 +3013,7 @@ function telegram_ensureAnswerBatchObserver() {
  );
 
  telegram_captureAnswerBatch();
+ telegram_queueRouteReconciliation();
 }
 
 function telegram_getAllLastBotMessages() {
@@ -2887,6 +3041,12 @@ if (
  setInterval(
  telegram_ensureAnswerBatchObserver,
  1000
+ );
+
+ telegramAnswerBatchCache.routeTimer =
+ setInterval(
+ telegram_reconcileRouteMessages,
+ 1500
  );
 }
 
@@ -2923,53 +3083,111 @@ function telegram_getMessageForMode(mode) {
 }
 
 const TELEGRAM_SEND_BUTTON_SELECTOR = 'button.btn-send, ' + 'button.bubbles-corner-button:not(.chat-secondary-button), ' + 'button[aria-label*="Send"], ' + 'button[aria-label*="보내"]';
-const TELEGRAM_TEXT_CHUNK_LIMIT = 3500;
+const TELEGRAM_SAFE_INSTRUCTION_CHUNK_LIMIT = 900;
+const TELEGRAM_SAFE_LONG_LINE_LIMIT = 1400;
 
 function telegram_splitTextIntoChunks(
-  text,
-  maxLength = TELEGRAM_TEXT_CHUNK_LIMIT
+  text
 ) {
-  const source = String(text || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n');
+  const source =
+    telegram_getExactComposerText(text);
 
   if (!source) {
-    return [];
+    return {
+      ok: false,
+      chunks: [],
+      source: '',
+      error: '전송할 내용이 없어요.'
+    };
   }
 
-  if (source.length <= maxLength) {
-    return [source];
+  if (
+    source.length <=
+    TELEGRAM_SAFE_INSTRUCTION_CHUNK_LIMIT
+  ) {
+    return {
+      ok: true,
+      chunks: [source],
+      source: source
+    };
   }
 
   const chunks = [];
   let offset = 0;
 
-  while (
-    source.length - offset >
-    maxLength
-  ) {
-    const limit = offset + maxLength;
-    let splitAt =
-      source.lastIndexOf('\n', limit - 1);
+  while (offset < source.length) {
+    const remaining = source.length - offset;
 
-    if (splitAt < offset) {
-      splitAt = limit;
-    } else {
-      splitAt += 1;
+    if (
+      remaining <=
+      TELEGRAM_SAFE_INSTRUCTION_CHUNK_LIMIT
+    ) {
+      chunks.push(source.slice(offset));
+      break;
     }
 
-    chunks.push(
-      source.slice(offset, splitAt)
+    const normalLimit =
+      offset +
+      TELEGRAM_SAFE_INSTRUCTION_CHUNK_LIMIT;
+    let boundary = source.lastIndexOf(
+      '\n',
+      normalLimit
     );
 
-    offset = splitAt;
+    if (boundary <= offset) {
+      const forwardBoundary = source.indexOf(
+        '\n',
+        normalLimit
+      );
+
+      if (
+        forwardBoundary < 0 ||
+        forwardBoundary - offset >
+          TELEGRAM_SAFE_LONG_LINE_LIMIT
+      ) {
+        return {
+          ok: false,
+          chunks: [],
+          source: source,
+          error:
+            '1400자 안에 줄바꿈이 없는 긴 줄은 원문을 보존해 안전하게 분할할 수 없어 전송을 중단했습니다.'
+        };
+      }
+
+      boundary = forwardBoundary;
+    }
+
+    const chunk = source.slice(offset, boundary);
+
+    if (!chunk) {
+      return {
+        ok: false,
+        chunks: [],
+        source: source,
+        error:
+          'Telegram 메시지 경계를 안전하게 결정하지 못했습니다.'
+      };
+    }
+
+    chunks.push(chunk);
+    offset = boundary + 1;
   }
 
-  if (offset < source.length) {
-    chunks.push(source.slice(offset));
+  if (chunks.join('\n') !== source) {
+    return {
+      ok: false,
+      chunks: [],
+      source: source,
+      error:
+        'Telegram 메시지 분할 후 원문 재구성 검증에 실패했습니다.'
+    };
   }
 
-  return chunks;
+  return {
+    ok: true,
+    chunks: chunks,
+    source: source
+  };
 }
 function telegram_isVisibleElement(el) { if (!el || !el.isConnected) { return false; } if (el.closest('[hidden], [aria-hidden="true"], [inert]')) { return false; } const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || style.pointerEvents === 'none') { return false; } const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) { return false; } return (rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth);}function telegram_getVisibleComposerInputs() { return Array.from(document.querySelectorAll('div.input-message-input[contenteditable="true"]')).filter(telegram_isVisibleElement);}function telegram_getVisibleButtonsInScope(scope) { if (!scope || !scope.querySelectorAll) { return []; } return Array.from(scope.querySelectorAll(TELEGRAM_SEND_BUTTON_SELECTOR)).filter(telegram_isVisibleElement);}function telegram_findComposerScope(input) { if (!input || !input.isConnected) { return null; } let node = input.parentElement; while (node && node !== document.body) { if (telegram_getVisibleButtonsInScope(node).length > 0) { return node; } node = node.parentElement; } return (input.closest('main') || input.parentElement || document.body);}function telegram_getNearestSendButton(scope, input) { const buttons = telegram_getVisibleButtonsInScope(scope); if (!buttons.length) { return null; } if (!input) { return buttons[0]; } const inputRect = input.getBoundingClientRect(); const inputX = inputRect.left + inputRect.width / 2; const inputY = inputRect.top + inputRect.height / 2; return buttons.map(function(button) { const rect = button.getBoundingClientRect(); const buttonX = rect.left + rect.width / 2; const buttonY = rect.top + rect.height / 2; return { button: button, distance: Math.abs(buttonX - inputX) + Math.abs(buttonY - inputY) }; }).sort(function(a, b) { return a.distance - b.distance; })[0].button;}function telegram_getComposerInput() { const candidates = telegram_getVisibleComposerInputs(); if (!candidates.length) { return null; } const activeElement = document.activeElement; if (activeElement && candidates.includes(activeElement)) { return activeElement; } const pairedCandidates = candidates.filter(function(input) { const scope = telegram_findComposerScope(input); return !!telegram_getNearestSendButton(scope, input); }); const source = pairedCandidates.length ? pairedCandidates : candidates; return source.map(function(input) { const rect = input.getBoundingClientRect(); const scope = telegram_findComposerScope(input); const button = telegram_getNearestSendButton(scope, input); return { input: input, hasButton: !!button, bottom: rect.bottom, area: rect.width * rect.height }; }).sort(function(a, b) { if (a.hasButton !== b.hasButton) { return a.hasButton ? -1 : 1; } if (a.bottom !== b.bottom) { return b.bottom - a.bottom; } return b.area - a.area; })[0].input;}function telegram_getSendButton(scope, input) { return telegram_getNearestSendButton(scope, input);}function telegram_getCurrentChatKey() {
  return (
@@ -3797,12 +4015,18 @@ async function telegram_sendTextFile(
   };
 }
 
-function telegram_normalizeComposerText(text) {
+function telegram_normalizeComposerVerificationText(text) {
  return normalizeBridgeText(text)
  .replace(/\u00a0/g, ' ')
  .replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '')
  .replace(/[ \t]+\n/g, '\n')
  .replace(/\n+$/g, '');
+}
+
+function telegram_normalizeComposerText(text) {
+ return telegram_normalizeComposerVerificationText(
+ text
+ );
 }
 
 function telegram_readComposerText(input) {
@@ -3950,6 +4174,502 @@ function telegram_composerMatches(
  );
 }
 
+function telegram_getExactComposerText(text) {
+ return telegram_normalizeComposerVerificationText(
+ text
+ );
+}
+
+function telegram_readComposerDomText(node) {
+ if (!node) return '';
+
+ if (node.nodeType === Node.TEXT_NODE) {
+ return node.nodeValue || '';
+ }
+
+ if (node.nodeType !== Node.ELEMENT_NODE) {
+ return '';
+ }
+
+ if (node.tagName === 'BR') {
+ return '\n';
+ }
+
+ return Array.from(node.childNodes)
+ .map(telegram_readComposerDomText)
+ .join('');
+}
+
+function telegram_readComposerCandidates(input) {
+ if (!input) {
+ return {
+ innerText: '',
+ textContent: '',
+ domWalker: ''
+ };
+ }
+
+ return {
+ innerText:
+ telegram_normalizeComposerVerificationText(
+ typeof input.innerText === 'string'
+ ? input.innerText
+ : ''
+ ),
+ textContent:
+ telegram_normalizeComposerVerificationText(
+ input.textContent || ''
+ ),
+ domWalker:
+ telegram_normalizeComposerVerificationText(
+ telegram_readComposerDomText(input)
+ )
+ };
+}
+
+function telegram_getExactComposerCandidate(
+ input,
+ expectedText
+) {
+ if (!input || !input.isConnected) {
+ return null;
+ }
+
+ const expected =
+ telegram_getExactComposerText(expectedText);
+ const candidates =
+ telegram_readComposerCandidates(input);
+
+ for (const source of [
+ 'innerText',
+ 'textContent',
+ 'domWalker'
+ ]) {
+ if (candidates[source] === expected) {
+ return {
+ source: source,
+ text: candidates[source],
+ candidates: candidates
+ };
+ }
+ }
+
+ return null;
+}
+
+function telegram_composerIsEmpty(input) {
+ const candidates =
+ telegram_readComposerCandidates(input);
+
+ return Object.values(candidates).every(
+ function(value) {
+ return value === '';
+ }
+ );
+}
+
+function telegram_composerExactlyMatches(
+ input,
+ expectedText
+) {
+ if (!input || !input.isConnected) {
+ return false;
+ }
+
+ return !!telegram_getExactComposerCandidate(
+ input,
+ expectedText
+ );
+}
+
+function telegram_findFirstMismatchIndex(a, b) {
+ const limit = Math.min(a.length, b.length);
+
+ for (let index = 0; index < limit; index += 1) {
+ if (a.charAt(index) !== b.charAt(index)) {
+ return index;
+ }
+ }
+
+ return a.length === b.length ? -1 : limit;
+}
+
+async function telegram_fillComposerIncrementallyLegacy(
+ transferContext,
+ expectedText,
+ chunkMeta
+) {
+ const expected =
+ telegram_getExactComposerText(expectedText);
+
+ if (!expected) {
+ return {
+ ok: false,
+ error: '전송할 내용이 없어요.'
+ };
+ }
+
+ let input =
+ telegram_getTransferComposer(transferContext);
+
+ if (!input) {
+ return {
+ ok: false,
+ error: 'Telegram 입력창을 찾을 수 없어요.'
+ };
+ }
+
+ if (telegram_readComposerText(input) !== '') {
+ return {
+ ok: false,
+ residual: true,
+ error:
+ 'Telegram 입력창에 기존 내용이 남아 있어 전송을 중단했습니다.'
+ };
+ }
+
+ let stalledAttempts = 0;
+ let verifiedLength = 0;
+
+ while (true) {
+ if (!telegram_isTransferChatCurrent(transferContext)) {
+ return {
+ ok: false,
+ changedChat: true,
+ error:
+ '전송 중 Telegram 채팅이 변경되어 중단했습니다.'
+ };
+ }
+
+ input = telegram_getTransferComposer(transferContext);
+
+ if (!input) {
+ return {
+ ok: false,
+ error: 'Telegram 입력창을 찾을 수 없어요.'
+ };
+ }
+
+ let current = telegram_readComposerText(input);
+
+ if (current === expected) {
+ const stable =
+ await telegram_waitForComposerExactStable(
+ transferContext,
+ expected,
+ 12000,
+ 600
+ );
+
+ if (stable.changedChat) {
+ return {
+ ok: false,
+ changedChat: true,
+ error:
+ '전송 중 Telegram 채팅이 변경되어 중단했습니다.'
+ };
+ }
+
+ if (!stable.ok) {
+ return {
+ ok: false,
+ error:
+ 'Telegram 입력이 완전히 안정되지 않아 자동 전송을 중단했습니다.'
+ };
+ }
+
+ return {
+ ok: true,
+ input: stable.input
+ };
+ }
+
+ if (!expected.startsWith(current)) {
+ const recovered =
+ await telegram_waitForComposerPrefix(
+ transferContext,
+ expected,
+ 800,
+ verifiedLength
+ );
+
+ if (recovered.changedChat) {
+ return {
+ ok: false,
+ changedChat: true,
+ error:
+ '전송 중 Telegram 채팅이 변경되어 중단했습니다.'
+ };
+ }
+
+ if (!recovered.ok) {
+ return telegram_createComposerMismatchResult(
+ expected,
+ recovered.current,
+ chunkMeta
+ );
+ }
+
+ input = recovered.input;
+ current = recovered.current;
+ }
+
+ verifiedLength = Math.max(
+ verifiedLength,
+ current.length
+ );
+
+ const beforeLength = current.length;
+ const targetLength =
+ telegram_getComposerSegmentEnd(
+ expected,
+ beforeLength
+ );
+ const segment = expected.slice(
+ beforeLength,
+ targetLength
+ );
+
+ const inserted =
+ telegram_appendComposerText(
+ input,
+ segment
+ );
+
+ if (!inserted) {
+ return {
+ ok: false,
+ error:
+ 'Telegram 입력을 삽입하지 못해 전송을 중단했습니다.'
+ };
+ }
+
+ const progressDeadline = Date.now() + 1500;
+ let progressed = false;
+
+ while (Date.now() < progressDeadline) {
+ if (!telegram_isTransferChatCurrent(transferContext)) {
+ return {
+ ok: false,
+ changedChat: true,
+ error:
+ '전송 중 Telegram 채팅이 변경되어 중단했습니다.'
+ };
+ }
+
+ input = telegram_getTransferComposer(transferContext);
+ let updated = telegram_readComposerText(input);
+
+ if (!expected.startsWith(updated)) {
+ const recovered =
+ await telegram_waitForComposerPrefix(
+ transferContext,
+ expected,
+ 800,
+ beforeLength
+ );
+
+ if (recovered.changedChat) {
+ return {
+ ok: false,
+ changedChat: true,
+ error:
+ '전송 중 Telegram 채팅이 변경되어 중단했습니다.'
+ };
+ }
+
+ if (!recovered.ok) {
+ return telegram_createComposerMismatchResult(
+ expected,
+ recovered.current,
+ chunkMeta
+ );
+ }
+
+ input = recovered.input;
+ updated = recovered.current;
+ }
+
+ if (updated.length > beforeLength) {
+ progressed = true;
+ verifiedLength = Math.max(
+ verifiedLength,
+ updated.length
+ );
+ break;
+ }
+
+ await sleep(100);
+ }
+
+ if (progressed) {
+ stalledAttempts = 0;
+ } else {
+ stalledAttempts += 1;
+
+ if (stalledAttempts >= 3) {
+ return {
+ ok: false,
+ residual: true,
+ error:
+ 'Telegram 입력이 진행되지 않아 전송을 중단했습니다.'
+ };
+ }
+ }
+ }
+}
+
+function telegram_createComposerCandidateDiagnostic(
+ expected,
+ candidates,
+ chunkMeta
+) {
+ const candidateDiagnostics = {};
+
+ for (const source of [
+ 'innerText',
+ 'textContent',
+ 'domWalker'
+ ]) {
+ const candidate = candidates[source] || '';
+ const mismatch =
+ telegram_findFirstMismatchIndex(
+ expected,
+ candidate
+ );
+
+ candidateDiagnostics[source] = {
+ length: candidate.length,
+ firstMismatchIndex: mismatch,
+ expectedCharCode:
+ mismatch >= 0 && mismatch < expected.length
+ ? expected.charCodeAt(mismatch)
+ : null,
+ candidateCharCode:
+ mismatch >= 0 && mismatch < candidate.length
+ ? candidate.charCodeAt(mismatch)
+ : null
+ };
+ }
+
+ const diagnostic = {
+ build: CTB_RUNTIME_BUILD,
+ chunkIndex: chunkMeta?.chunkIndex || null,
+ chunkCount: chunkMeta?.chunkCount || null,
+ expectedLength: expected.length,
+ candidates: candidateDiagnostics,
+ insertionMethod: 'single_native_paste'
+ };
+
+ console.warn(
+ '[CTB Telegram composer verification]',
+ diagnostic
+ );
+
+ return {
+ ok: false,
+ residual: true,
+ diagnostic: diagnostic,
+ error:
+ 'Telegram 입력 검증 실패 · inner ' +
+ candidateDiagnostics.innerText.length +
+ ' / text ' +
+ candidateDiagnostics.textContent.length +
+ ' / expected ' +
+ expected.length
+ };
+}
+
+async function telegram_fillComposerReliably(
+ transferContext,
+ expectedText,
+ chunkMeta
+) {
+ const expected =
+ telegram_getExactComposerText(expectedText);
+
+ if (!expected) {
+ return {
+ ok: false,
+ error: '전송할 내용이 없어요.'
+ };
+ }
+
+ let input =
+ telegram_getTransferComposer(transferContext);
+
+ if (!input) {
+ return {
+ ok: false,
+ error: 'Telegram 입력창을 찾을 수 없어요.'
+ };
+ }
+
+ if (!telegram_composerIsEmpty(input)) {
+ return {
+ ok: false,
+ residual: true,
+ error:
+ 'Telegram 입력창에 기존 내용이 남아 있어 전송을 중단했습니다.'
+ };
+ }
+
+ input.focus();
+
+ if (!dispatchPasteText(input, expected)) {
+ return {
+ ok: false,
+ error:
+ 'Telegram 입력창에 내용을 붙여넣지 못했습니다.'
+ };
+ }
+
+ const deadline = Date.now() + 5000;
+ let stableSince = 0;
+
+ while (Date.now() < deadline) {
+ if (!telegram_isTransferChatCurrent(transferContext)) {
+ return {
+ ok: false,
+ changedChat: true,
+ error:
+ '전송 중 Telegram 채팅이 변경되어 중단했습니다.'
+ };
+ }
+
+ input = telegram_getTransferComposer(transferContext);
+ const exact =
+ telegram_getExactComposerCandidate(
+ input,
+ expected
+ );
+
+ if (exact) {
+ if (!stableSince) {
+ stableSince = Date.now();
+ }
+
+ if (Date.now() - stableSince >= 400) {
+ return {
+ ok: true,
+ input: input,
+ candidateSource: exact.source
+ };
+ }
+ } else {
+ stableSince = 0;
+ }
+
+ await sleep(100);
+ }
+
+ return telegram_createComposerCandidateDiagnostic(
+ expected,
+ telegram_readComposerCandidates(input),
+ chunkMeta
+ );
+}
+
 function telegram_getTransferComposer(
  transferContext
 ) {
@@ -4014,7 +4734,48 @@ async function telegram_waitForComposerMatch(
  };
 }
 
-async function telegram_clearComposer(input) { if (!input || !input.isConnected) { return false; } input.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null })); await sleep(120); return (telegram_readComposerText(input) === '');}async function telegram_insertByPaste(input, text) { if (!input || !input.isConnected) { return false; } input.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); await sleep(80); return dispatchPasteText(input, text);}async function telegram_insertByTextFallback(input, text) { if (!input || !input.isConnected) { return false; } const cleared = await telegram_clearComposer(input); if (!cleared) { return false; } input.focus(); const inserted = document.execCommand('insertText', false, text); input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text })); return !!inserted;}async function telegram_waitForSendButton(
+async function telegram_waitForComposerExactStable(
+ transferContext,
+ expectedText,
+ timeoutMs,
+ stableMs
+) {
+ const deadline = Date.now() + timeoutMs;
+ let stableSince = 0;
+
+ while (Date.now() < deadline) {
+ if (!telegram_isTransferChatCurrent(transferContext)) {
+ return { ok: false, changedChat: true, input: null };
+ }
+
+ const input =
+ telegram_getTransferComposer(transferContext);
+
+ if (
+ input &&
+ telegram_composerExactlyMatches(input, expectedText)
+ ) {
+ if (!stableSince) stableSince = Date.now();
+
+ if (Date.now() - stableSince >= stableMs) {
+ return { ok: true, changedChat: false, input: input };
+ }
+ } else {
+ stableSince = 0;
+ }
+
+ await sleep(100);
+ }
+
+ return {
+ ok: false,
+ changedChat:
+ !telegram_isTransferChatCurrent(transferContext),
+ input: telegram_getTransferComposer(transferContext)
+ };
+}
+
+async function telegram_clearComposer(input) { if (!input || !input.isConnected) { return false; } input.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null })); await sleep(120); return (telegram_readComposerText(input) === '');}async function telegram_insertByPaste(input, text) { if (!input || !input.isConnected) { return false; } input.focus(); return dispatchPasteText(input, text);}async function telegram_insertByTextFallback(input, text) { if (!input || !input.isConnected) { return false; } const cleared = await telegram_clearComposer(input); if (!cleared) { return false; } input.focus(); const inserted = document.execCommand('insertText', false, text); input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text })); return !!inserted;}async function telegram_waitForSendButton(
  transferContext,
  expectedText,
  timeoutMs
@@ -4046,7 +4807,7 @@ async function telegram_clearComposer(input) { if (!input || !input.isConnected)
  }
 
  if (
- !telegram_composerMatches(
+ !telegram_composerExactlyMatches(
  input,
  expectedText
  )
@@ -4092,13 +4853,160 @@ async function telegram_clearComposer(input) { if (!input || !input.isConnected)
  };
 }
 
+function telegram_readOutgoingMessageText(bubble) {
+ if (!bubble) return '';
+
+ const body = bubble.querySelector(
+ '.message .text-content, ' +
+ '.text-content, ' +
+ '.message-text, ' +
+ '[data-message-text], ' +
+ '[class*="text-content"], ' +
+ '.text'
+ );
+ const rawText = body
+ ? (
+ typeof body.innerText === 'string'
+ ? body.innerText
+ : body.textContent || ''
+ )
+ : telegram_cacheBubbleText(bubble);
+
+ return telegram_getExactComposerText(rawText);
+}
+
+function telegram_getOutgoingBubbleEntries() {
+ const root = telegram_findMessageRoot();
+
+ if (!root) return [];
+
+ return Array.from(
+ root.querySelectorAll('.bubble')
+ ).map(function(bubble, domIndex) {
+ if (!telegram_cacheIsOutgoingBubble(bubble)) {
+ return null;
+ }
+
+ const descriptor =
+ telegram_cacheBubbleDescriptor(bubble, 'out');
+
+ return {
+ key: descriptor.key,
+ order: descriptor.order,
+ text: telegram_readOutgoingMessageText(bubble),
+ domIndex: domIndex,
+ bubble: bubble
+ };
+ }).filter(Boolean);
+}
+
+function telegram_captureOutgoingBaseline() {
+ const entries = telegram_getOutgoingBubbleEntries();
+ const numericOrders = entries
+ .map(function(entry) {
+ return entry.order;
+ })
+ .filter(function(order) {
+ return typeof order === 'number';
+ });
+ const last = entries.length
+ ? entries[entries.length - 1]
+ : null;
+
+ return {
+ keys: new Set(
+ entries.map(function(entry) {
+ return entry.key;
+ })
+ ),
+ nodes: new Set(
+ entries.map(function(entry) {
+ return entry.bubble;
+ })
+ ),
+ maxNumericOrder: numericOrders.length
+ ? Math.max(...numericOrders)
+ : null,
+ bubbleCount: entries.length,
+ lastKey: last?.key || '',
+ lastOrder:
+ typeof last?.order === 'number'
+ ? last.order
+ : null,
+ lastDomIndex: last?.domIndex ?? -1
+ };
+}
+
+function telegram_findNewOutgoingBubble(baseline) {
+ const entries = telegram_getOutgoingBubbleEntries();
+
+ for (const entry of entries) {
+ if (
+ typeof entry.order === 'number' &&
+ typeof baseline?.maxNumericOrder === 'number' &&
+ entry.order > baseline.maxNumericOrder
+ ) {
+ return entry;
+ }
+
+ const hasStableKey =
+ !!entry.key &&
+ !entry.key.startsWith('out:text:');
+
+ if (
+ hasStableKey &&
+ !baseline?.keys?.has(entry.key)
+ ) {
+ return entry;
+ }
+
+ if (
+ entries.length >
+ (baseline?.bubbleCount || 0) &&
+ entry.domIndex >
+ (baseline?.lastDomIndex ?? -1) &&
+ !baseline?.nodes?.has(entry.bubble)
+ ) {
+ return entry;
+ }
+ }
+
+ return null;
+}
+
+function telegram_createOutgoingTextDiagnostic(
+ expectedText,
+ outgoingText
+) {
+ const expected =
+ telegram_getExactComposerText(expectedText);
+ const outgoing =
+ telegram_getExactComposerText(outgoingText);
+
+ return {
+ exactMatch: outgoing === expected,
+ expectedLength: expected.length,
+ outgoingReadLength: outgoing.length,
+ firstMismatchIndex:
+ telegram_findFirstMismatchIndex(
+ expected,
+ outgoing
+ )
+ };
+}
+
 async function telegram_waitForSendCompletion(
  transferContext,
  expectedText,
- timeoutMs
+ timeoutMs,
+ outgoingBaseline
 ) {
  const deadline =
  Date.now() + timeoutMs;
+
+ let emptySince = 0;
+ let sawEmpty = false;
+ let sentBubble = null;
 
  while (Date.now() < deadline) {
  if (
@@ -4119,45 +5027,67 @@ async function telegram_waitForSendCompletion(
  );
 
  if (!input) {
- await sleep(250);
+ emptySince = 0;
+ await sleep(100);
  continue;
  }
 
+ if (telegram_composerIsEmpty(input)) {
+ sawEmpty = true;
+
+ if (!emptySince) {
+ emptySince = Date.now();
+ }
+
+ const newOutgoing =
+ telegram_findNewOutgoingBubble(
+ outgoingBaseline
+ );
+
+ if (newOutgoing && !sentBubble) {
+ const textDiagnostic =
+ telegram_createOutgoingTextDiagnostic(
+ expectedText,
+ newOutgoing.text
+ );
+
+ if (!textDiagnostic.exactMatch) {
+ console.warn(
+ '[CTB Telegram outgoing text diagnostic]',
+ textDiagnostic
+ );
+ }
+
+ newOutgoing.textDiagnostic = textDiagnostic;
+ }
+
+ sentBubble = sentBubble || newOutgoing;
+
  if (
- telegram_readComposerText(input) === ''
+ sentBubble &&
+ Date.now() - emptySince >= 700
  ) {
  return {
  ok: true,
  changedChat: false,
- uncertain: false
+ uncertain: false,
+ sentBubble: sentBubble
  };
  }
-
- if (
- !telegram_composerMatches(
- input,
- expectedText
- )
- ) {
- const current =
- telegram_readComposerText(input);
-
- if (!current) {
- return {
- ok: true,
- changedChat: false,
- uncertain: false
- };
- }
-
+ } else {
+ if (sawEmpty) {
  return {
  ok: false,
  changedChat: false,
- uncertain: true
+ uncertain: true,
+ residual: true
  };
  }
 
- await sleep(250);
+ emptySince = 0;
+ }
+
+ await sleep(100);
  }
 
  return {
@@ -4166,13 +5096,21 @@ async function telegram_waitForSendCompletion(
  !telegram_isTransferChatCurrent(
  transferContext
  ),
- uncertain: true
+ uncertain: true,
+ residual:
+ !telegram_composerIsEmpty(
+ telegram_getTransferComposer(
+ transferContext
+ )
+ ),
+ outgoingFound: !!sentBubble
  };
 }
 
 async function telegram_sendMessage(
  text,
- autoSend
+ autoSend,
+ chunkMeta
 ) {
  if (telegram_sendMessage.__busy) {
  return {
@@ -4214,6 +5152,15 @@ async function telegram_sendMessage(
  };
  }
 
+ if (!telegram_composerIsEmpty(input)) {
+ return {
+ ok: false,
+ error:
+ '이전 Telegram 전송 내용이 입력창에 남아 있어 다음 조각 전송을 중단했습니다.',
+ residual: true
+ };
+ }
+
  const normalizedText =
  normalizeBridgeText(
  text
@@ -4227,25 +5174,11 @@ async function telegram_sendMessage(
  };
  }
 
- const pasted =
- await telegram_insertByPaste(
- input,
- normalizedText
- );
-
- if (!pasted) {
- return {
- ok: false,
- error:
- 'Telegram 입력창에 코드를 붙여넣지 못했습니다.'
- };
- }
-
  const pasteResult =
- await telegram_waitForComposerMatch(
+ await telegram_fillComposerReliably(
  transferContext,
  normalizedText,
- 12000
+ chunkMeta
  );
 
  if (pasteResult.changedChat) {
@@ -4258,9 +5191,13 @@ async function telegram_sendMessage(
 
  if (!pasteResult.ok) {
  return {
+ ...pasteResult,
  ok: false,
  error:
- '긴 코드 입력 완료를 확인하지 못했습니다. 처음 붙여넣은 내용은 지우지 않았습니다.'
+ pasteResult.error ||
+ '긴 코드 입력 완료를 확인하지 못했습니다. 입력된 내용은 지우지 않았습니다.',
+ chunkIndex: chunkMeta?.chunkIndex,
+ chunkCount: chunkMeta?.chunkCount
  };
  }
 
@@ -4301,7 +5238,7 @@ async function telegram_sendMessage(
  );
 
  if (
- !telegram_composerMatches(
+ !telegram_composerExactlyMatches(
  finalInput,
  normalizedText
  )
@@ -4309,16 +5246,23 @@ async function telegram_sendMessage(
  return {
  ok: false,
  error:
- '전송 직전 Telegram 코드 입력 상태가 변경되어 자동 전송을 중단했습니다.'
+ 'Telegram 입력이 완전히 안정되지 않아 자동 전송을 중단했습니다.'
  };
  }
 
  const button =
  buttonResult.button;
 
+ const outgoingBaseline =
+ telegram_captureOutgoingBaseline();
+
  if (
+ !telegram_isTransferChatCurrent(
+ transferContext
+ ) ||
  !button ||
  !button.isConnected ||
+ !telegram_isVisibleElement(button) ||
  button.disabled ||
  button.getAttribute(
  'aria-disabled'
@@ -4337,7 +5281,8 @@ async function telegram_sendMessage(
  await telegram_waitForSendCompletion(
  transferContext,
  normalizedText,
- 10000
+ 10000,
+ outgoingBaseline
  );
 
  if (completion.ok) {
@@ -4356,10 +5301,21 @@ async function telegram_sendMessage(
  };
  }
 
+ if (completion.residual) {
  return {
  ok: false,
  error:
- '전송 버튼은 한 번 클릭했지만 완료를 확인하지 못했습니다. 중복 방지를 위해 다시 전송하지 않았습니다.'
+ 'Telegram 전송 후 일부 내용이 입력창에 남아 중단했습니다. 남은 내용은 삭제하지 않았습니다.',
+ residual: true
+ };
+ }
+
+ return {
+ ok: false,
+ error:
+ 'Telegram 전송 결과를 확인하지 못해 중단했습니다. 중복 전송 방지를 위해 다시 보내지 않았습니다.',
+ chunkIndex: chunkMeta?.chunkIndex,
+ chunkCount: chunkMeta?.chunkCount
  };
  } finally {
  telegram_sendMessage.__busy =
@@ -4371,20 +5327,27 @@ async function telegram_sendTextChunks(
  text,
  autoSend
 ) {
- const chunks =
+ const splitResult =
  telegram_splitTextIntoChunks(text);
+ const chunks = splitResult.chunks;
 
- if (!chunks.length) {
+ if (!splitResult.ok || !chunks.length) {
  return {
  ok: false,
- error: '전송할 내용이 없어요.'
+ error:
+ splitResult.error ||
+ '전송할 내용이 없어요.'
  };
  }
 
  if (!autoSend) {
  return telegram_sendMessage(
- chunks.join(''),
- false
+ splitResult.source,
+ false,
+ {
+ chunkIndex: 1,
+ chunkCount: 1
+ }
  );
  }
 
@@ -4398,15 +5361,300 @@ async function telegram_sendTextChunks(
  result =
  await telegram_sendMessage(
  chunks[index],
- true
+ true,
+ {
+ chunkIndex: index + 1,
+ chunkCount: chunks.length
+ }
  );
 
  if (!result?.ok) {
- return result;
+ return {
+ ...result,
+ chunkIndex: index + 1,
+ chunkCount: chunks.length,
+ error:
+ 'Telegram ' +
+ (index + 1) +
+ '/' +
+ chunks.length +
+ ' 전송 중단: ' +
+ (result?.error || '전송 결과를 확인하지 못했습니다.')
+ };
  }
  }
 
  return result;
+}
+
+async function telegram_sendWholeTextOnce(
+  text,
+  autoSend
+) {
+  if (
+    telegram_sendWholeTextOnce.__busy
+  ) {
+    return {
+      ok: false,
+      error:
+        'Telegram 전송이 이미 진행 중이에요.'
+    };
+  }
+
+  telegram_sendWholeTextOnce.__busy =
+    true;
+
+  try {
+    const source =
+      normalizeBridgeText(text);
+
+    if (!source.trim()) {
+      return {
+        ok: false,
+        error:
+          '전송할 내용이 없어요.'
+      };
+    }
+
+    const transferContext =
+      telegram_createTransferContext();
+
+    if (!transferContext) {
+      return {
+        ok: false,
+        error:
+          'Telegram 입력창을 찾을 수 없어요.'
+      };
+    }
+
+    let input =
+      telegram_refreshTransferContext(
+        transferContext
+      );
+
+    if (!input) {
+      return {
+        ok: false,
+        error:
+          'Telegram 입력창을 찾을 수 없어요.'
+      };
+    }
+
+    /*
+     * 기존 작성 중인 내용은 절대 지우지 않는다.
+     */
+    if (
+      telegram_readComposerText(
+        input
+      ).trim()
+    ) {
+      return {
+        ok: false,
+        error:
+          'Telegram 입력창에 기존 내용이 있어 전송하지 않았습니다.'
+      };
+    }
+
+    input.focus();
+
+    /*
+     * 핵심:
+     * 전체 원문을 딱 한 번만 paste.
+     */
+    const pasted =
+      dispatchPasteText(
+        input,
+        source
+      );
+
+    if (!pasted) {
+      return {
+        ok: false,
+        error:
+          'Telegram에 전체 코드를 붙여넣지 못했습니다.'
+      };
+    }
+
+    /*
+     * Telegram DOM 표현을 원문과 exact 비교하지 않는다.
+     * 붙여넣기 후 실제 입력 내용이 생겼는지만 확인한다.
+     */
+    const pasteDeadline =
+      Date.now() + 5000;
+
+    while (
+      Date.now() < pasteDeadline
+    ) {
+      if (
+        !telegram_isTransferChatCurrent(
+          transferContext
+        )
+      ) {
+        return {
+          ok: false,
+          error:
+            '붙여넣는 중 Telegram 채팅이 변경되었습니다.'
+        };
+      }
+
+      input =
+        telegram_refreshTransferContext(
+          transferContext
+        );
+
+      if (
+        input &&
+        telegram_readComposerText(
+          input
+        ).length > 0
+      ) {
+        break;
+      }
+
+      await sleep(100);
+    }
+
+    if (
+      !input ||
+      !telegram_readComposerText(
+        input
+      ).length
+    ) {
+      return {
+        ok: false,
+        error:
+          'Telegram 입력창에 전체 코드가 들어오지 않았습니다.'
+      };
+    }
+
+    if (!autoSend) {
+      return {
+        ok: true,
+        pasted: true,
+        sent: false
+      };
+    }
+
+    /*
+     * Send 버튼도 딱 한 번 클릭.
+     * Telegram이 긴 메시지를 나누는 것은
+     * Telegram 자체 동작에 맡긴다.
+     */
+    const buttonDeadline =
+      Date.now() + 5000;
+
+    let button = null;
+
+    while (
+      Date.now() < buttonDeadline
+    ) {
+      button =
+        telegram_getTransferSendButton(
+          transferContext
+        );
+
+      if (
+        button &&
+        button.isConnected &&
+        telegram_isVisibleElement(
+          button
+        ) &&
+        !button.disabled &&
+        button.getAttribute(
+          'aria-disabled'
+        ) !== 'true'
+      ) {
+        break;
+      }
+
+      button = null;
+      await sleep(100);
+    }
+
+    if (!button) {
+      return {
+        ok: false,
+        error:
+          'Telegram 전송 버튼을 찾을 수 없습니다.'
+      };
+    }
+
+    button.click();
+
+    /*
+     * 반복 전송/재클릭 없음.
+     * Telegram composer가 완전히 비어 있는 상태가
+     * 700ms 유지되면 완료로 본다.
+     */
+    const sendDeadline =
+      Date.now() + 15000;
+
+    let emptySince = 0;
+
+    while (
+      Date.now() < sendDeadline
+    ) {
+      if (
+        !telegram_isTransferChatCurrent(
+          transferContext
+        )
+      ) {
+        return {
+          ok: false,
+          error:
+            '전송 중 Telegram 채팅이 변경되었습니다.'
+        };
+      }
+
+      input =
+        telegram_refreshTransferContext(
+          transferContext
+        );
+
+      if (!input) {
+        await sleep(100);
+        continue;
+      }
+
+      const current =
+        telegram_readComposerText(
+          input
+        );
+
+      if (!current) {
+        if (!emptySince) {
+          emptySince = Date.now();
+        }
+
+        if (
+          Date.now() -
+            emptySince >=
+          700
+        ) {
+          return {
+            ok: true,
+            pasted: true,
+            sent: true,
+            singlePaste: true,
+            singleSendClick: true
+          };
+        }
+      } else {
+        emptySince = 0;
+      }
+
+      await sleep(100);
+    }
+
+    return {
+      ok: false,
+      error:
+        'Telegram 전송 버튼은 한 번 눌렀지만 입력창이 비워지지 않았습니다. 자동 재전송하지 않았습니다.'
+    };
+  } finally {
+    telegram_sendWholeTextOnce.__busy =
+      false;
+  }
 }
 
 // ────────────────────────────────────────
@@ -4526,11 +5774,11 @@ const PANEL_STYLES = `
     }
     .ctb-tg { background: #2AABEE !important; }
     .ctb-cls { background: #a78bfa !important; }
-    #ctb-ai-autosend-label, #ctb-tg-autosend-label {
+    #ctb-ai-autosend-label, #ctb-ai-auto-return-label, #ctb-tg-autosend-label {
       display: flex !important; align-items: center !important; gap: 4px;
       margin-top: 2px; cursor: pointer; user-select: none;
     }
-    #ctb-ai-autosend-label span, #ctb-tg-autosend-label span { font-size: 9px !important; color: #a0a0b0 !important; line-height: 1.2; }
+    #ctb-ai-autosend-label span, #ctb-ai-auto-return-label span, #ctb-tg-autosend-label span { font-size: 9px !important; color: #a0a0b0 !important; line-height: 1.2; }
     #ctb-autosend { width: 11px; height: 11px; accent-color: #2AABEE; cursor: pointer; flex-shrink: 0; }
     #ctb-mode-row {
       display: flex; gap: 4px; margin-bottom: 5px;
@@ -5069,6 +6317,29 @@ function syncBridgeTargetPickerVisibility() {
 // ────────────────────────────────────────
 // AI 위젯 (AI→TG 전용)
 // ────────────────────────────────────────
+function normalizeAutoReturnConversationUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.origin + url.pathname;
+  } catch (error) {
+    return '';
+  }
+}
+
+function getAutoReturnRouteStatusView(status) {
+  const views = {
+    awaiting_job: ['⏳ GPT 회신 예약 · Job 연결 대기', ''],
+    awaiting_result: ['⏳ GPT 회신 예약 · 완료 대기', ''],
+    collecting_result: ['⏳ 완료보고 수집 중...', ''],
+    delivering: ['⏳ GPT로 완료보고 전달 중...', ''],
+    delivered: ['✅ 완료보고 GPT 전달 완료', 'ok'],
+    ambiguous: ['⚠️ GPT 회신 연결 확인 필요', 'err'],
+    delivery_failed: ['❌ GPT 자동전달 실패', 'err'],
+    cancelled: ['⚠️ GPT 회신 예약 취소', 'err']
+  };
+  return views[status] || null;
+}
+
 function injectAIWidget() {
   if (document.getElementById('ctb-ai-panel')) return;
 
@@ -5109,6 +6380,10 @@ function injectAIWidget() {
       <label id="ctb-ai-autosend-label" style="display:flex !important;align-items:center;gap:4px;margin-top:2px;cursor:pointer">
         <input type="checkbox" id="ctb-ai-autosend" checked style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
         <span>전송까지 자동으로</span>
+      </label>
+      <label id="ctb-ai-auto-return-label" style="display:flex !important;align-items:center;gap:4px;margin-top:2px;cursor:pointer">
+        <input type="checkbox" id="ctb-ai-auto-return" checked style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
+        <span>완료보고 → GPT 자동전달</span>
       </label>
       <button id="ctb-ai-switch" class="ctb-switch-btn">🔁 위젯 전환</button>
       <div id="ctb-status"></div>
@@ -5359,6 +6634,7 @@ function injectAIWidget() {
   const statusEl = panel.querySelector('#ctb-status');
   const btn1 = panel.querySelector('#ctb-ai-btn1');
   const autoCheck = panel.querySelector('#ctb-ai-autosend');
+  const autoReturnCheck = panel.querySelector('#ctb-ai-auto-return');
   const deepSeekCurrentEl = panel.querySelector('#ctb-deepseek-current');
   const deepSeekUsageEl = panel.querySelector('#ctb-deepseek-usage');
   const deepSeekUsageValueEl = panel.querySelector('#ctb-deepseek-usage-value');
@@ -5708,6 +6984,103 @@ function injectAIWidget() {
     return aiSourceTarget ? aiSourceTarget.id : null;
   }
 
+  function getSelectedAISource() {
+    /*
+     * AI 사이트 자체에서 버튼을 누른 경우에는
+     * 현재 탭이 source다.
+     *
+     * id:null은 background에서 sender.tab을 사용하라는 뜻이며,
+     * sender가 AI URL일 때만 허용된다.
+     */
+    if (isCurrentPageAI) {
+      return {
+        id: null,
+        url: location.href,
+        title:
+          document.title ||
+          SITE_NAME ||
+          ''
+      };
+    }
+
+    /*
+     * Telegram 페이지에서는 select에서 사용자가 선택한
+     * 실제 AI tab만 source가 될 수 있다.
+     */
+    if (
+      !aiSourceSelect ||
+      aiSourceSelect.selectedIndex < 0
+    ) {
+      return null;
+    }
+
+    const selected =
+      aiSourceSelect.options[
+        aiSourceSelect.selectedIndex
+      ];
+
+    if (
+      !selected ||
+      !selected.value
+    ) {
+      return null;
+    }
+
+    const id =
+      Number(selected.value);
+
+    const url =
+      String(
+        selected.dataset.url || ''
+      );
+
+    const title =
+      String(
+        selected.title ||
+        selected.textContent ||
+        ''
+      );
+
+    if (
+      !Number.isFinite(id) ||
+      id <= 0
+    ) {
+      return null;
+    }
+
+    let validAiUrl = false;
+
+    try {
+      const parsed =
+        new URL(url);
+
+      validAiUrl =
+        parsed.protocol === 'https:' &&
+        (
+          parsed.hostname ===
+            'chatgpt.com' ||
+          parsed.hostname ===
+            'chat.openai.com' ||
+          parsed.hostname ===
+            'claude.ai' ||
+          parsed.hostname ===
+            'gemini.google.com'
+        );
+    } catch (e) {
+      validAiUrl = false;
+    }
+
+    if (!validAiUrl) {
+      return null;
+    }
+
+    return {
+      id: id,
+      url: url,
+      title: title
+    };
+  }
+
   function updateAISourcePanelUI() {
     if (isCurrentPageAI) {
       if (aiSourceSelect) {
@@ -5754,6 +7127,7 @@ function injectAIWidget() {
           o.value = String(t.id); o.textContent = t.title || siteName;
           o.title = t.title || siteName;
           o.dataset.site = site; o.dataset.siteName = siteName;
+          o.dataset.url = t.url || '';
           aiSourceSelect.appendChild(o);
         });
         var selectedTabId = null;
@@ -5768,7 +7142,7 @@ function injectAIWidget() {
         var selectedOption = Array.from(aiSourceSelect.options).find(function(x) { return Number(x.value) === selectedTabId; });
         var selectedTab = tabs.find(function(x) { return Number(x.id) === selectedTabId; });
         if (selectedOption && selectedTab) {
-          applyAISource({ site: selectedOption.dataset.site, siteName: selectedOption.dataset.siteName, title: selectedTab.title || selectedOption.textContent, id: selectedTab.id });
+          applyAISource({ site: selectedOption.dataset.site, siteName: selectedOption.dataset.siteName, title: selectedTab.title || selectedOption.textContent, id: selectedTab.id, url: selectedTab.url || '' });
         }
         updateAISourcePanelUI();
         if (typeof done === 'function') done();
@@ -5797,7 +7171,8 @@ function injectAIWidget() {
         site: selected.dataset.site,
         siteName: selected.dataset.siteName,
         title: selected.title || selected.textContent,
-        id: Number(selected.value)
+        id: Number(selected.value),
+        url: selected.dataset.url || ''
       });
     } else {
       applyAISource(null);
@@ -5812,13 +7187,87 @@ function injectAIWidget() {
   autoCheck.addEventListener('change', () => {
     chrome.storage.local.set({ bridge_autosend_ai: autoCheck.checked });
   });
+  chrome.storage.local.get(['bridge_auto_return_enabled'], (res) => {
+    autoReturnCheck.checked =
+      res?.bridge_auto_return_enabled !== false;
+  });
+  autoReturnCheck.addEventListener('change', () => {
+    chrome.storage.local.set({
+      bridge_auto_return_enabled:
+        autoReturnCheck.checked
+    });
+  });
   const setStatus = (msg, type) => setPanelStatus(statusEl, msg, type);
   const setBtnsDisabled = (v) => setPanelBtnsDisabled([btn1], v);
 
+  function applyAutoReturnRouteStatus(routes) {
+    if (SITE !== 'chatgpt' || !Array.isArray(routes)) return;
+
+    const currentUrl =
+      normalizeAutoReturnConversationUrl(location.href);
+    const route = routes
+      .filter(function(item) {
+        return (
+          item?.sourceConversationUrl === currentUrl &&
+          item.routingVersion === '059-3' &&
+          item.autoReturn === true
+        );
+      })
+      .sort(function(a, b) {
+        return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
+      })[0];
+
+    if (!route) return;
+    const view = getAutoReturnRouteStatusView(route.status);
+    if (!view) return;
+
+    setStatus(view[0], view[1]);
+
+    if (
+      route.status === 'ambiguous' ||
+      route.status === 'delivery_failed'
+    ) {
+      console.warn('[CTB auto return route]', {
+        routeId: route.routeId,
+        stage: route.stage,
+        jobId: route.jobId,
+        status: route.status,
+        error: route.error || ''
+      });
+    }
+  }
+
+  function refreshAutoReturnRouteStatus() {
+    chrome.storage.local.get(
+      ['bridge_auto_return_routes'],
+      function(res) {
+        applyAutoReturnRouteStatus(
+          res?.bridge_auto_return_routes
+        );
+      }
+    );
+  }
+
+  chrome.storage.onChanged.addListener(
+    function(changes, areaName) {
+      if (
+        areaName === 'local' &&
+        changes?.bridge_auto_return_routes
+      ) {
+        applyAutoReturnRouteStatus(
+          changes.bridge_auto_return_routes.newValue
+        );
+      }
+    }
+  );
+
+  refreshAutoReturnRouteStatus();
+
   let telegramSendQueued = false;
   let telegramSendQueueSending = false;
-  let telegramSendQueueTargetTabId = null;
+  let telegramSendQueueSource = null;
   let telegramSendQueueAutoSend = true;
+  let telegramSendQueueAutoReturn = true;
 
   function renderTelegramQueueButton() {
     if (telegramSendQueued) {
@@ -5871,7 +7320,7 @@ function injectAIWidget() {
 
     telegramSendQueued = false;
     telegramSendQueueSending = false;
-    telegramSendQueueTargetTabId = null;
+    telegramSendQueueSource = null;
 
     renderTelegramQueueButton();
 
@@ -5881,19 +7330,26 @@ function injectAIWidget() {
   }
 
   function queueTelegramSend(
-    targetTabId,
-    autoSend
+    sourceAi,
+    autoSend,
+    autoReturn
   ) {
     telegramSendQueued = true;
     telegramSendQueueSending = false;
 
-    telegramSendQueueTargetTabId =
-      targetTabId
-        ? Number(targetTabId)
-        : null;
+    telegramSendQueueSource = sourceAi
+      ? {
+          id: sourceAi.id ? Number(sourceAi.id) : null,
+          url: sourceAi.url || '',
+          title: sourceAi.title || ''
+        }
+      : null;
 
     telegramSendQueueAutoSend =
       !!autoSend;
+
+    telegramSendQueueAutoReturn =
+      !!autoReturn;
 
     renderTelegramQueueButton();
 
@@ -5905,17 +7361,18 @@ function injectAIWidget() {
   function sendAiResponseToTelegram(options) {
     const opts = options || {};
 
-    const targetTabId =
+    const sourceAi =
       Object.prototype.hasOwnProperty.call(
         opts,
-        'targetTabId'
+        'sourceAi'
       )
-        ? opts.targetTabId
-        : (
-            isCurrentPageAI
-              ? null
-              : getSelectedAISourceTabId()
-          );
+        ? opts.sourceAi
+        : getSelectedAISource();
+
+    if (!sourceAi) {
+      setStatus('❌ 선택한 AI 탭을 찾을 수 없습니다.', 'err');
+      return;
+    }
 
     const autoSend =
       Object.prototype.hasOwnProperty.call(
@@ -5926,6 +7383,14 @@ function injectAIWidget() {
         : autoCheck.checked;
 
     const queued = !!opts.queued;
+
+    const autoReturn =
+      Object.prototype.hasOwnProperty.call(
+        opts,
+        'autoReturn'
+      )
+        ? !!opts.autoReturn
+        : autoReturnCheck.checked;
 
     if (queued) {
       if (
@@ -5950,7 +7415,10 @@ function injectAIWidget() {
       {
         action: 'aiToTelegram',
         autoSend: autoSend,
-        targetTabId: targetTabId
+        autoReturn: autoReturn,
+        sourceAiTabId: sourceAi.id,
+        sourceAiUrl: sourceAi.url,
+        sourceAiTitle: sourceAi.title
       },
       function(res) {
         setBtnsDisabled(false);
@@ -5965,7 +7433,7 @@ function injectAIWidget() {
         if (runtimeError) {
           if (queued) {
             telegramSendQueued = false;
-            telegramSendQueueTargetTabId = null;
+            telegramSendQueueSource = null;
             renderTelegramQueueButton();
           }
 
@@ -5980,16 +7448,35 @@ function injectAIWidget() {
         if (res?.ok) {
           if (queued) {
             telegramSendQueued = false;
-            telegramSendQueueTargetTabId = null;
+            telegramSendQueueSource = null;
             renderTelegramQueueButton();
           }
 
           setStatus(
-            queued
-              ? '✅ 예약 Telegram 전송!'
-              : '✅ Telegram 전송!',
+            res.autoReturnReserved
+              ? (
+                  queued
+                    ? '✅ 예약 Telegram 전송! · GPT 회신 예약'
+                    : '✅ Telegram 전송! · GPT 회신 예약'
+                )
+              : (
+                  res.autoReturnFailed
+                    ? '⚠️ Telegram 전송됨 · 회신 예약 실패'
+                    : (
+                        queued
+                          ? '✅ 예약 Telegram 전송!'
+                          : '✅ Telegram 전송!'
+                      )
+                ),
             'ok'
           );
+
+          if (res.autoReturnReserved) {
+            setTimeout(
+              refreshAutoReturnRouteStatus,
+              400
+            );
+          }
 
           return;
         }
@@ -6028,10 +7515,12 @@ function injectAIWidget() {
 
               sendAiResponseToTelegram({
                 queued: true,
-                targetTabId:
-                  telegramSendQueueTargetTabId,
+                sourceAi:
+                  telegramSendQueueSource,
                 autoSend:
-                  telegramSendQueueAutoSend
+                  telegramSendQueueAutoSend,
+                autoReturn:
+                  telegramSendQueueAutoReturn
               });
             },
             1500
@@ -6042,7 +7531,7 @@ function injectAIWidget() {
 
         if (queued) {
           telegramSendQueued = false;
-          telegramSendQueueTargetTabId = null;
+          telegramSendQueueSource = null;
           renderTelegramQueueButton();
         }
 
@@ -6069,10 +7558,15 @@ function injectAIWidget() {
       const autoSend =
         autoCheck.checked;
 
-      const targetTabId =
-        isCurrentPageAI
-          ? null
-          : getSelectedAISourceTabId();
+      const autoReturn =
+        autoReturnCheck.checked;
+
+      const sourceAi = getSelectedAISource();
+
+      if (!sourceAi) {
+        setStatus('❌ 선택한 AI 탭을 찾을 수 없습니다.', 'err');
+        return;
+      }
 
       if (isCurrentPageAI) {
         let currentlyStreaming =
@@ -6088,16 +7582,18 @@ function injectAIWidget() {
 
         if (currentlyStreaming) {
           queueTelegramSend(
-            null,
-            autoSend
+            sourceAi,
+            autoSend,
+            autoReturn
           );
 
           return;
         }
 
         sendAiResponseToTelegram({
-          targetTabId: null,
+          sourceAi: sourceAi,
           autoSend: autoSend,
+          autoReturn: autoReturn,
           queued: false
         });
 
@@ -6113,7 +7609,9 @@ function injectAIWidget() {
       chrome.runtime.sendMessage(
         {
           action: 'checkAiTabStreaming',
-          targetTabId: targetTabId
+          sourceAiTabId: sourceAi.id,
+          sourceAiUrl: sourceAi.url,
+          sourceAiTitle: sourceAi.title
         },
         function(res) {
           setBtnsDisabled(false);
@@ -6146,16 +7644,26 @@ function injectAIWidget() {
 
           if (res.streaming) {
             queueTelegramSend(
-              targetTabId,
-              autoSend
+              {
+                id: res.tabId,
+                url: res.url || sourceAi.url,
+                title: res.title || sourceAi.title
+              },
+              autoSend,
+              autoReturn
             );
 
             return;
           }
 
           sendAiResponseToTelegram({
-            targetTabId: targetTabId,
+            sourceAi: {
+              id: res.tabId,
+              url: res.url || sourceAi.url,
+              title: res.title || sourceAi.title
+            },
             autoSend: autoSend,
+            autoReturn: autoReturn,
             queued: false
           });
         }
@@ -6274,11 +7782,14 @@ function injectAIWidget() {
         telegramSendQueued &&
         !telegramSendQueueSending
       ) {
-        const queuedTargetTabId =
-          telegramSendQueueTargetTabId;
+        const queuedSourceAi =
+          telegramSendQueueSource;
 
         const queuedAutoSend =
           telegramSendQueueAutoSend;
+
+        const queuedAutoReturn =
+          telegramSendQueueAutoReturn;
 
         setTimeout(
           function() {
@@ -6291,10 +7802,12 @@ function injectAIWidget() {
 
             sendAiResponseToTelegram({
               queued: true,
-              targetTabId:
-                queuedTargetTabId,
+              sourceAi:
+                queuedSourceAi,
               autoSend:
-                queuedAutoSend
+                queuedAutoSend,
+              autoReturn:
+                queuedAutoReturn
             });
           },
           350
@@ -6318,17 +7831,19 @@ function injectAIWidget() {
     if (_streamingCheckBusy) return;
     _streamingCheckBusy = true;
 
-    var selectedAiTabId =
-      telegramSendQueued &&
-      telegramSendQueueTargetTabId
-        ? telegramSendQueueTargetTabId
-        : getSelectedAISourceTabId();
+    var selectedAiSource =
+      telegramSendQueued && telegramSendQueueSource
+        ? telegramSendQueueSource
+        : getSelectedAISource();
+    var selectedAiTabId = selectedAiSource?.id || null;
     console.log('[AI-STREAM-REMOTE] selectedAiTabId=', selectedAiTabId, 'aiSourceTarget=', aiSourceTarget ? aiSourceTarget.id : null);
 
     try {
       chrome.runtime.sendMessage({
         action: 'checkAiTabStreaming',
-        targetTabId: selectedAiTabId
+        sourceAiTabId: selectedAiTabId,
+        sourceAiUrl: selectedAiSource?.url || '',
+        sourceAiTitle: selectedAiSource?.title || ''
       }, function(res) {
         var runtimeError = chrome.runtime.lastError;
 
@@ -6803,7 +8318,43 @@ function injectTokenCounter() {
 // ────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === 'getResponse') {
-    sendResponse({ text: getResponse() });
+    if (SITE === 'telegram') {
+      sendResponse({
+        text: null,
+        error:
+          'telegram_cannot_be_ai_source',
+        sourceSite: 'telegram',
+        sourceUrl: location.href
+      });
+
+      return true;
+    }
+
+    /*
+     * ChatGPT 코드 모드는 background가
+     * 실제 코드박스 Copy 버튼을 눌러 원문을 확보한다.
+     */
+    if (
+      SITE === 'chatgpt' &&
+      copyMode === 'code'
+    ) {
+      sendResponse({
+        text: null,
+        useNativeCodeCopy: true,
+        sourceSite: SITE,
+        sourceUrl: location.href
+      });
+
+      return true;
+    }
+
+    sendResponse({
+      text: getResponse(),
+      useNativeCodeCopy: false,
+      sourceSite: SITE,
+      sourceUrl: location.href
+    });
+
     return true;
   }
   if (msg.action === 'checkStreaming') {
@@ -6818,8 +8369,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ text: telegram_getMessageForMode(msg.tgCopyMode || 'all') });
     return true;
   }
+  if (msg.action === 'getTelegramRouteContext') {
+    sendResponse(
+      telegram_getRouteContext()
+    );
+    return true;
+  }
   if (msg.action === 'sendToTelegram') {
-    telegram_sendTextChunks(
+    telegram_sendWholeTextOnce(
       msg.text,
       msg.autoSend
     ).then(sendResponse);
