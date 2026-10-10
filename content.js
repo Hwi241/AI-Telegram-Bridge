@@ -6,7 +6,7 @@ window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__ = true;
 
 // content.js v5.0
 // Claude, ChatGPT, Gemini, Telegram 범용 지원
-const CTB_RUNTIME_BUILD = '059-12';
+const CTB_RUNTIME_BUILD = '060-1';
 
 console.log(
   '[CTB] content runtime ' +
@@ -6381,7 +6381,7 @@ function injectAIWidget() {
         <input type="checkbox" id="ctb-ai-autosend" checked style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
         <span>전송까지 자동으로</span>
       </label>
-      <label id="ctb-ai-auto-return-label" style="display:flex !important;align-items:center;gap:4px;margin-top:2px;cursor:pointer">
+      <label id="ctb-ai-auto-return-label" style="display:none !important">
         <input type="checkbox" id="ctb-ai-auto-return" checked style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
         <span>완료보고 → GPT 자동전달</span>
       </label>
@@ -7261,8 +7261,6 @@ function injectAIWidget() {
     }
   );
 
-  refreshAutoReturnRouteStatus();
-
   let telegramSendQueued = false;
   let telegramSendQueueSending = false;
   let telegramSendQueueSource = null;
@@ -7415,7 +7413,6 @@ function injectAIWidget() {
       {
         action: 'aiToTelegram',
         autoSend: autoSend,
-        autoReturn: autoReturn,
         sourceAiTabId: sourceAi.id,
         sourceAiUrl: sourceAi.url,
         sourceAiTitle: sourceAi.title
@@ -7453,30 +7450,11 @@ function injectAIWidget() {
           }
 
           setStatus(
-            res.autoReturnReserved
-              ? (
-                  queued
-                    ? '✅ 예약 Telegram 전송! · GPT 회신 예약'
-                    : '✅ Telegram 전송! · GPT 회신 예약'
-                )
-              : (
-                  res.autoReturnFailed
-                    ? '⚠️ Telegram 전송됨 · 회신 예약 실패'
-                    : (
-                        queued
-                          ? '✅ 예약 Telegram 전송!'
-                          : '✅ Telegram 전송!'
-                      )
-                ),
+            queued
+              ? '✅ 예약 Telegram 전송!'
+              : '✅ Telegram 전송!',
             'ok'
           );
-
-          if (res.autoReturnReserved) {
-            setTimeout(
-              refreshAutoReturnRouteStatus,
-              400
-            );
-          }
 
           return;
         }
