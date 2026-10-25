@@ -6,7 +6,7 @@ window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__ = true;
 
 // content.js v5.0
 // Claude, ChatGPT, Gemini, Telegram 범용 지원
-const CTB_RUNTIME_BUILD = '060-1';
+const CTB_RUNTIME_BUILD = '061-8';
 
 console.log(
   '[CTB] content runtime ' +
@@ -1581,7 +1581,8 @@ function chatgpt_composerLooksComplete(
 function chatgpt_waitForReadyAndSend(
  expectedText,
  timeoutMs,
- changeTracker
+ changeTracker,
+ expectedConversationUrl
 ) {
  return new Promise(function(resolve) {
  const anchors =
@@ -1875,6 +1876,19 @@ function chatgpt_waitForReadyAndSend(
  return;
  }
 
+ if (
+ expectedConversationUrl &&
+ normalizeAutoReturnConversationUrl(location.href) !==
+ expectedConversationUrl
+ ) {
+ finish({
+ ok: false,
+ error: '자동전송 도중 원본 ChatGPT 대화가 변경됨'
+ });
+
+ return;
+ }
+
  finished = true;
  cleanup();
 
@@ -1993,7 +2007,8 @@ function chatgpt_waitForReadyAndSend(
 
 async function chatgpt_pasteInput(
  text,
- autoSend
+ autoSend,
+ expectedConversationUrl
 ) {
  if (chatgpt_pasteInput.__busy) {
  return {
@@ -2121,7 +2136,8 @@ async function chatgpt_pasteInput(
  chatgpt_waitForReadyAndSend(
  expectedText,
  20000,
- changeTracker
+ changeTracker,
+ expectedConversationUrl
  );
  } finally {
  chatgpt_pasteInput.__busy =
@@ -2636,6 +2652,274 @@ function telegram_sortCachedMessages() {
  telegram_rebuildMessageIndex();
 }
 
+const ctbReportProbe = {
+  active: false,
+  chatKey: '',
+  jobId: '',
+  readySequence: '',
+  routeToken: '',
+  status: 'idle',
+  seen: new Map(),
+  candidates: []
+};
+
+function ctbReportProbeShow(message, type) {
+  const panel = document.getElementById('ctb-tg-panel');
+  const statusEl = panel?.querySelector('#ctb-status');
+
+  if (statusEl) {
+    setPanelStatus(statusEl, message, type || '');
+  }
+
+  const copyButton = panel?.querySelector(
+    '#ctb-report-probe-copy'
+  );
+
+  if (copyButton) {
+    const canCopy =
+      ctbReportProbe.status === 'ready_detected' &&
+      ctbReportProbe.candidates.length > 0;
+
+    copyButton.style.display =
+      canCopy ? 'block' : 'none';
+  }
+}
+
+function ctbReportProbeStop(status, message, type) {
+  ctbReportProbe.active = false;
+  ctbReportProbe.status = status;
+
+  ctbReportProbeShow(message, type);
+
+  console.info('[CTB REPORT PROBE]', {
+    status: status,
+    jobId: ctbReportProbe.jobId,
+    readySequence: ctbReportProbe.readySequence,
+    candidateCount: ctbReportProbe.candidates.length
+  });
+}
+
+function ctbReportProbeArm(routeToken) {
+  if (SITE !== 'telegram') return;
+
+  ctbReportProbe.active = false;
+
+  telegram_ensureAnswerBatchObserver();
+  telegram_captureAnswerBatch();
+
+  ctbReportProbe.chatKey = telegram_getCurrentChatKey();
+  ctbReportProbe.jobId = '';
+  ctbReportProbe.readySequence = '';
+  ctbReportProbe.routeToken =
+    typeof routeToken === 'string' ? routeToken : '';
+  ctbReportProbe.status = 'waiting_job';
+  ctbReportProbe.candidates = [];
+  ctbReportProbe.seen = new Map();
+
+  telegramAnswerBatchCache.messages.forEach(function(message) {
+    ctbReportProbe.seen.set(message.key, message.text);
+  });
+
+  ctbReportProbe.active = true;
+
+  ctbReportProbeShow('⏳ Job 등록 감지 대기');
+
+  console.info('[CTB REPORT PROBE]', {
+    status: 'waiting_job',
+    chatKeyMatched: true
+  });
+}
+
+function ctbReportProbeCancel() {
+  if (!ctbReportProbe.active) return;
+
+  ctbReportProbeStop(
+    'cancelled',
+    '⚠️ 감지 예약 취소',
+    'err'
+  );
+}
+
+function ctbReportProbeObserve(descriptor) {
+  if (
+    SITE !== 'telegram' ||
+    !ctbReportProbe.active ||
+    !descriptor?.key ||
+    !descriptor?.text
+  ) {
+    return;
+  }
+
+  if (
+    ctbReportProbe.chatKey !==
+    telegram_getCurrentChatKey()
+  ) {
+    ctbReportProbeStop(
+      'ambiguous',
+      '⚠️ Telegram 채팅이 변경됨',
+      'err'
+    );
+    return;
+  }
+
+  if (
+    ctbReportProbe.seen.get(descriptor.key) ===
+    descriptor.text
+  ) {
+    return;
+  }
+
+  ctbReportProbe.seen.set(
+    descriptor.key,
+    descriptor.text
+  );
+
+  const lines = normalizeBridgeText(descriptor.text)
+    .split('\n')
+    .map(function(line) {
+      return line.trim();
+    });
+
+  const jobLine = lines.find(function(line) {
+    return /^Job:\s*J\d{4,}-\d{6}-\d{2}$/.test(line);
+  });
+
+  if (jobLine) {
+    const nextJobId = jobLine.replace(/^Job:\s*/, '');
+
+    if (
+      ctbReportProbe.jobId &&
+      ctbReportProbe.jobId !== nextJobId
+    ) {
+      ctbReportProbeStop(
+        'ambiguous',
+        '⚠️ 서로 다른 Job ID 감지',
+        'err'
+      );
+      return;
+    }
+
+    if (!ctbReportProbe.jobId) {
+      ctbReportProbe.jobId = nextJobId;
+
+      if (ctbReportProbe.routeToken) {
+        chrome.runtime.sendMessage({
+          action: 'ctbAutoReturnJob',
+          token: ctbReportProbe.routeToken,
+          jobId: nextJobId
+        }, function() {
+          void chrome.runtime.lastError;
+        });
+      }
+
+      ctbReportProbe.status = 'waiting_report';
+
+      ctbReportProbeShow(
+        '⏳ ' + nextJobId + ' 결과 대기'
+      );
+    }
+
+    return;
+  }
+
+  const readyLine = lines.find(function(line) {
+    return /^CTB_REPORT_READY J\d{4,}-\d{6}-\d{2} R[1-9]\d*$/.test(line);
+  });
+
+  if (readyLine) {
+    const matched = readyLine.match(
+      /^CTB_REPORT_READY (J\d{4,}-\d{6}-\d{2}) (R[1-9]\d*)$/
+    );
+
+    if (
+      !matched ||
+      !ctbReportProbe.jobId ||
+      matched[1] !== ctbReportProbe.jobId
+    ) {
+      ctbReportProbeStop(
+        'ambiguous',
+        '⚠️ 종료 신호 Job ID 불일치',
+        'err'
+      );
+      return;
+    }
+
+    ctbReportProbe.readySequence = matched[2];
+
+    ctbReportProbeStop(
+      'ready_detected',
+      '✅ ' + matched[1] + ' ' + matched[2] +
+        ' 감지 · 후보 ' +
+        ctbReportProbe.candidates.length + '개',
+      'ok'
+    );
+
+    if (ctbReportProbe.routeToken) {
+      const candidateCount =
+        ctbReportProbe.candidates.length;
+
+      const candidateText =
+        candidateCount === 1
+          ? ctbReportProbe.candidates[0].text
+          : '';
+
+      chrome.runtime.sendMessage(
+        {
+          action: 'ctbAutoReturnReady',
+          token: ctbReportProbe.routeToken,
+          jobId: ctbReportProbe.jobId,
+          sequence: ctbReportProbe.readySequence,
+          candidateCount: candidateCount,
+          text: candidateText
+        },
+        function(result) {
+          const runtimeError = chrome.runtime.lastError;
+
+          if (runtimeError || !result?.ok) {
+            ctbReportProbeShow(
+              '⚠️ GPT 자동전송 미확인 · 수동전달 가능',
+              'err'
+            );
+            return;
+          }
+
+          ctbReportProbeShow(
+            '✅ GPT 전송 버튼 클릭 완료',
+            'ok'
+          );
+        }
+      );
+    }
+
+    return;
+  }
+
+  if (!ctbReportProbe.jobId) return;
+
+  const existing = ctbReportProbe.candidates.find(
+    function(item) {
+      return item.key === descriptor.key;
+    }
+  );
+
+  if (existing) {
+    existing.text = descriptor.text;
+  } else {
+    ctbReportProbe.candidates.push({
+      key: descriptor.key,
+      text: descriptor.text
+    });
+  }
+
+  if (ctbReportProbe.candidates.length > 200) {
+    ctbReportProbeStop(
+      'ambiguous',
+      '⚠️ 수집 상한 초과 · 확인 필요',
+      'err'
+    );
+  }
+}
+
 function telegram_storeCachedMessage(
   descriptor
 ) {
@@ -2674,6 +2958,8 @@ function telegram_storeCachedMessage(
  descriptor
  );
 
+ ctbReportProbeObserve(descriptor);
+
  return;
  }
 
@@ -2696,6 +2982,8 @@ function telegram_storeCachedMessage(
  telegram_notifyRouteIncoming(
  descriptor
  );
+
+ ctbReportProbeObserve(descriptor);
 }
 
 const telegramRouteIncomingKeys =
@@ -6328,12 +6616,13 @@ function normalizeAutoReturnConversationUrl(value) {
 
 function getAutoReturnRouteStatusView(status) {
   const views = {
+    sending: ['⏳ Telegram 전송 중', ''],
     awaiting_job: ['⏳ GPT 회신 예약 · Job 연결 대기', ''],
     awaiting_result: ['⏳ GPT 회신 예약 · 완료 대기', ''],
     collecting_result: ['⏳ 완료보고 수집 중...', ''],
-    delivering: ['⏳ GPT로 완료보고 전달 중...', ''],
-    delivered: ['✅ 완료보고 GPT 전달 완료', 'ok'],
-    ambiguous: ['⚠️ GPT 회신 연결 확인 필요', 'err'],
+    delivering: ['⏳ GPT 자동전송 중', ''],
+    delivered: ['✅ GPT 전송 버튼 클릭 완료', 'ok'],
+    ambiguous: ['⚠️ 자동전송 확인 필요', 'err'],
     delivery_failed: ['❌ GPT 자동전달 실패', 'err'],
     cancelled: ['⚠️ GPT 회신 예약 취소', 'err']
   };
@@ -6381,8 +6670,8 @@ function injectAIWidget() {
         <input type="checkbox" id="ctb-ai-autosend" checked style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
         <span>전송까지 자동으로</span>
       </label>
-      <label id="ctb-ai-auto-return-label" style="display:none !important">
-        <input type="checkbox" id="ctb-ai-auto-return" checked style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
+      <label id="ctb-ai-auto-return-label" style="display:flex !important;align-items:center;gap:4px;margin-top:2px;cursor:pointer">
+        <input type="checkbox" id="ctb-ai-auto-return" style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
         <span>완료보고 → GPT 자동전달</span>
       </label>
       <button id="ctb-ai-switch" class="ctb-switch-btn">🔁 위젯 전환</button>
@@ -6635,6 +6924,15 @@ function injectAIWidget() {
   const btn1 = panel.querySelector('#ctb-ai-btn1');
   const autoCheck = panel.querySelector('#ctb-ai-autosend');
   const autoReturnCheck = panel.querySelector('#ctb-ai-auto-return');
+  const autoReturnLabel = panel.querySelector('#ctb-ai-auto-return-label');
+
+  if (autoReturnLabel && SITE !== 'chatgpt') {
+    autoReturnLabel.style.setProperty(
+      'display',
+      'none',
+      'important'
+    );
+  }
   const deepSeekCurrentEl = panel.querySelector('#ctb-deepseek-current');
   const deepSeekUsageEl = panel.querySelector('#ctb-deepseek-usage');
   const deepSeekUsageValueEl = panel.querySelector('#ctb-deepseek-usage-value');
@@ -7189,7 +7487,7 @@ function injectAIWidget() {
   });
   chrome.storage.local.get(['bridge_auto_return_enabled'], (res) => {
     autoReturnCheck.checked =
-      res?.bridge_auto_return_enabled !== false;
+      res?.bridge_auto_return_enabled === true;
   });
   autoReturnCheck.addEventListener('change', () => {
     chrome.storage.local.set({
@@ -7209,7 +7507,7 @@ function injectAIWidget() {
       .filter(function(item) {
         return (
           item?.sourceConversationUrl === currentUrl &&
-          item.routingVersion === '059-3' &&
+          item.routingVersion === '061-8' &&
           item.autoReturn === true
         );
       })
@@ -7413,6 +7711,10 @@ function injectAIWidget() {
       {
         action: 'aiToTelegram',
         autoSend: autoSend,
+        autoReturn:
+          SITE === 'chatgpt' &&
+          autoSend === true &&
+          autoReturn === true,
         sourceAiTabId: sourceAi.id,
         sourceAiUrl: sourceAi.url,
         sourceAiTitle: sourceAi.title
@@ -7883,6 +8185,7 @@ function injectTGWidget() {
         <button id="ctb-tgmode-all" class="ctb-mode-btn ctb-mode-active">답변전체</button>
         <button id="ctb-tgmode-last" class="ctb-mode-btn">마지막1개</button>
       </div>
+      <button id="ctb-report-probe-copy" class="ctb-btn" style="display:none">📋 수집 후보 복사</button>
       <select id="ctb-ai-select" style="width:100%;margin-bottom:5px;padding:2px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;"><option value="">탭 목록 받는 중...</option></select>
       <div id="ctb-tg-current-tab-label" style="display:none;width:100%;margin-bottom:5px;padding:3px 4px;font-size:9px;background:#2a2a55;color:#a78bfa;border:1px solid #3a3a5c;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></div><label id="ctb-tg-autosend-label" style="display:flex !important;align-items:center;gap:4px;margin-top:2px;cursor:pointer">
         <input type="checkbox" id="ctb-tg-autosend" checked style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
@@ -8233,6 +8536,66 @@ function injectTGWidget() {
   const setStatus = (msg, type) => setPanelStatus(statusEl, msg, type);
   const setBtnsDisabled = (v) => setPanelBtnsDisabled([btn2], v);
 
+  const reportProbeCopyBtn = panel.querySelector(
+    '#ctb-report-probe-copy'
+  );
+
+  if (reportProbeCopyBtn) {
+    reportProbeCopyBtn.addEventListener(
+      'click',
+      async function() {
+        if (
+          ctbReportProbe.status !== 'ready_detected' ||
+          !ctbReportProbe.jobId ||
+          !ctbReportProbe.candidates.length ||
+          ctbReportProbe.chatKey !== telegram_getCurrentChatKey()
+        ) {
+          setStatus(
+            '⚠️ 확인 가능한 후보가 없습니다.',
+            'err'
+          );
+          return;
+        }
+
+        const candidateText =
+          ctbReportProbe.candidates
+            .map(function(item) {
+              return item.text;
+            })
+            .filter(Boolean)
+            .join('\n\n');
+
+        if (!candidateText.trim()) {
+          setStatus(
+            '⚠️ 후보 내용이 비어 있습니다.',
+            'err'
+          );
+          return;
+        }
+
+        try {
+          await navigator.clipboard.writeText(
+            candidateText
+          );
+
+          setStatus(
+            '📋 후보 ' +
+            ctbReportProbe.candidates.length +
+            '개 복사 · ' +
+            candidateText.length +
+            '자',
+            'ok'
+          );
+        } catch (error) {
+          setStatus(
+            '❌ 클립보드 복사 실패',
+            'err'
+          );
+        }
+      }
+    );
+  }
+
   // ── CHECKBOX 진단 ──
   const tgChk = panel.querySelector('#ctb-tg-autosend');
   if (tgChk) {
@@ -8339,6 +8702,84 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ streaming: isStreaming() });
     return true;
   }
+  if (msg.action === 'ctbAutoReturnDeliver') {
+    (async function() {
+      if (
+        SITE !== 'chatgpt' ||
+        !msg.conversationUrl ||
+        normalizeAutoReturnConversationUrl(location.href) !==
+          msg.conversationUrl
+      ) {
+        return {
+          ok: false,
+          error: '원본 ChatGPT 대화가 일치하지 않음'
+        };
+      }
+
+      const input = chatgpt_getInputEl();
+
+      if (!input) {
+        return {
+          ok: false,
+          error: 'ChatGPT 입력창 없음'
+        };
+      }
+
+      const existingText =
+        chatgpt_normalizeComposerText(
+          getContentEditablePlainText(input)
+        ).trim();
+
+      if (existingText) {
+        return {
+          ok: false,
+          error: '작성 중인 ChatGPT 입력 내용이 있어 자동전송 차단'
+        };
+      }
+
+      if (chatgpt_isStreaming()) {
+        return {
+          ok: false,
+          error: 'ChatGPT가 현재 답변 중이어서 자동전송 차단'
+        };
+      }
+
+      const attachments =
+        chatgpt_getAttachmentState(input);
+
+      if (
+        attachments.count > 0 ||
+        attachments.busy
+      ) {
+        return {
+          ok: false,
+          error: '기존 ChatGPT 첨부파일 또는 업로드 작업이 있어 자동전송 차단'
+        };
+      }
+
+      const result = await chatgpt_pasteInput(
+        msg.text,
+        true,
+        msg.conversationUrl
+      );
+
+      return {
+        ok: result?.ok === true && result?.sent === true,
+        sent: result?.sent === true,
+        error: result?.error || ''
+      };
+    })()
+      .then(sendResponse)
+      .catch(function(error) {
+        sendResponse({
+          ok: false,
+          sent: false,
+          error: error?.message || String(error)
+        });
+      });
+
+    return true;
+  }
   if (msg.action === 'pasteToAI') {
     pasteToAI(msg.text, msg.autoSend).then(sendResponse);
     return true;
@@ -8354,10 +8795,47 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.action === 'sendToTelegram') {
+    if (
+      ctbReportProbe.active &&
+      ctbReportProbe.routeToken &&
+      msg.autoSend === true
+    ) {
+      sendResponse({
+        ok: false,
+        error: '이전 자동회신 Job이 진행 중입니다.'
+      });
+
+      return true;
+    }
+
+    const probeRequested =
+      SITE === 'telegram' &&
+      msg.autoSend === true;
+
+    if (probeRequested) {
+      ctbReportProbeArm(msg.ctbReturnToken || '');
+    }
+
     telegram_sendWholeTextOnce(
       msg.text,
       msg.autoSend
-    ).then(sendResponse);
+    ).then(function(result) {
+      if (!result?.ok && probeRequested) {
+        ctbReportProbeCancel();
+      }
+
+      sendResponse(result);
+    }).catch(function(error) {
+      if (probeRequested) {
+        ctbReportProbeCancel();
+      }
+
+      sendResponse({
+        ok: false,
+        error: error?.message || String(error)
+      });
+    });
+
     return true;
   }
 });

@@ -447,11 +447,241 @@ async function captureChatgptCodeByCopyButton(tabId) {
   return result.text;
 }
 
+const CTB_RETURN_VERSION = '061-8';
+const CTB_RETURN_KEY = 'bridge_auto_return_routes';
+
+let ctbReturnDeliveryBusy = false;
+
+function ctbReturnConversationUrl(value) {
+  try {
+    const url = new URL(value);
+
+    if (
+      url.protocol !== 'https:' ||
+      !['chatgpt.com', 'chat.openai.com'].includes(url.hostname)
+    ) {
+      return '';
+    }
+
+    const path = url.pathname.replace(/\/$/, '');
+
+    if (!/(?:^|\/)c\/[a-zA-Z0-9-]+$/.test(path)) {
+      return '';
+    }
+
+    return url.origin + path;
+  } catch {
+    return '';
+  }
+}
+
+async function ctbReadReturnRoute() {
+  const data = await chrome.storage.local.get(CTB_RETURN_KEY);
+  const routes = data[CTB_RETURN_KEY];
+
+  if (!Array.isArray(routes)) return null;
+
+  return routes.find(function(route) {
+    return route?.routingVersion === CTB_RETURN_VERSION;
+  }) || null;
+}
+
+async function ctbWriteReturnRoute(route) {
+  const data = await chrome.storage.local.get(CTB_RETURN_KEY);
+  const existing = Array.isArray(data[CTB_RETURN_KEY])
+    ? data[CTB_RETURN_KEY]
+    : [];
+
+  const retained = existing.filter(function(item) {
+    return item?.routingVersion !== CTB_RETURN_VERSION;
+  });
+
+  await chrome.storage.local.set({
+    [CTB_RETURN_KEY]: [...retained, route]
+  });
+}
+
+async function ctbChangeReturnRoute(token, allowedStatuses, patch) {
+  const current = await ctbReadReturnRoute();
+
+  if (
+    !current ||
+    current.token !== token ||
+    !allowedStatuses.includes(current.status)
+  ) {
+    return null;
+  }
+
+  const updated = {
+    ...current,
+    ...patch,
+    updatedAt: Date.now()
+  };
+
+  await ctbWriteReturnRoute(updated);
+
+  return updated;
+}
+
+function ctbValidTelegramSender(sender, route, token) {
+  return !!(
+    sender?.tab &&
+    sender.tab.id === route?.telegramTabId &&
+    isTelegramDestinationUrl(sender.tab.url) &&
+    token &&
+    token === route?.token
+  );
+}
+
+async function ctbHandleReturnJob(message, sender) {
+  const route = await ctbReadReturnRoute();
+
+  if (
+    !ctbValidTelegramSender(sender, route, message.token) ||
+    !/^J\d{4,}-\d{6}-\d{2}$/.test(message.jobId || '')
+  ) {
+    return { ok: false, error: '예약 검증 실패' };
+  }
+
+  if (
+    route.status === 'awaiting_result' &&
+    route.jobId === message.jobId
+  ) {
+    return { ok: true };
+  }
+
+  const updated = await ctbChangeReturnRoute(
+    message.token,
+    ['sending', 'awaiting_job'],
+    {
+      status: 'awaiting_result',
+      jobId: message.jobId
+    }
+  );
+
+  return {
+    ok: !!updated,
+    error: updated ? '' : 'Job 연결 상태 불일치'
+  };
+}
+
+async function ctbHandleReturnReady(message, sender) {
+  if (ctbReturnDeliveryBusy) {
+    return { ok: false, error: '전달 처리 중' };
+  }
+
+  const route = await ctbReadReturnRoute();
+
+  if (
+    !ctbValidTelegramSender(sender, route, message.token) ||
+    route.status !== 'awaiting_result' ||
+    route.jobId !== message.jobId ||
+    !/^R[1-9]\d*$/.test(message.sequence || '')
+  ) {
+    return { ok: false, error: 'Job 또는 종료 신호 불일치' };
+  }
+
+  if (
+    message.candidateCount !== 1 ||
+    typeof message.text !== 'string' ||
+    !message.text.trim()
+  ) {
+    await ctbChangeReturnRoute(
+      route.token,
+      ['awaiting_result'],
+      {
+        status: 'ambiguous',
+        error: '완료보고 후보가 정확히 1개가 아님'
+      }
+    );
+
+    return {
+      ok: false,
+      error: '후보 개수 불확실 · 수동 전달 필요'
+    };
+  }
+
+  ctbReturnDeliveryBusy = true;
+
+  try {
+    const claimed = await ctbChangeReturnRoute(
+      route.token,
+      ['awaiting_result'],
+      {
+        status: 'delivering',
+        sequence: message.sequence,
+        claimedAt: Date.now()
+      }
+    );
+
+    if (!claimed) {
+      return { ok: false, error: '전달 예약 선점 실패' };
+    }
+
+    const target = await chrome.tabs.get(route.sourceTabId);
+
+    if (
+      !target ||
+      ctbReturnConversationUrl(target.url) !==
+        route.sourceConversationUrl
+    ) {
+      throw new Error('원본 ChatGPT 대화 탭이 변경됨');
+    }
+
+    // 자동전송은 sendToTab()의 재주입/재시도 경로를 사용하지 않는다.
+    // 응답 유실 시 중복 전송을 막기 위해 정확히 한 번만 호출한다.
+    const result = await chrome.tabs.sendMessage(
+      target.id,
+      {
+        action: 'ctbAutoReturnDeliver',
+        conversationUrl: route.sourceConversationUrl,
+        text: message.text
+      }
+    );
+
+    const sent = result?.ok === true && result?.sent === true;
+
+    await ctbChangeReturnRoute(
+      route.token,
+      ['delivering'],
+      {
+        status: sent ? 'delivered' : 'delivery_failed',
+        error: sent ? '' : (result?.error || 'ChatGPT 전송 미확인'),
+        completedAt: Date.now()
+      }
+    );
+
+    return {
+      ok: sent,
+      error: sent ? '' : (result?.error || 'ChatGPT 전송 미확인')
+    };
+  } catch (error) {
+    try {
+      await ctbChangeReturnRoute(
+        route.token,
+        ['delivering'],
+        {
+          status: 'ambiguous',
+          error: error?.message || '전달 상태 확인 실패'
+        }
+      );
+    } catch {}
+
+    return {
+      ok: false,
+      error: error?.message || '자동전달 실패'
+    };
+  } finally {
+    ctbReturnDeliveryBusy = false;
+  }
+}
+
 // AI → Telegram
 async function handleAiToTelegram(
   senderTabId,
   autoSend,
-  sourceRequest
+  sourceRequest,
+  autoReturn
 ) {
   const sourceAiTab =
     await resolveAiSourceTab(
@@ -572,14 +802,108 @@ async function handleAiToTelegram(
     };
   }
 
-  return sendToTab(
-    tgTab.id,
-    {
-      action: 'sendToTelegram',
-      text: aiRes.text,
-      autoSend: !!autoSend
+  let returnRoute = null;
+
+  if (autoReturn === true) {
+    const conversationUrl =
+      ctbReturnConversationUrl(sourceAiTab.url);
+
+    if (
+      autoSend !== true ||
+      expectedSourceSite !== 'chatgpt' ||
+      !conversationUrl
+    ) {
+      return {
+        ok: false,
+        error: '자동회신은 원본 ChatGPT 대화와 Telegram 자동전송이 필요합니다.'
+      };
     }
-  );
+
+    const previous = await ctbReadReturnRoute();
+
+    const activeStatuses = [
+      'sending',
+      'awaiting_job',
+      'awaiting_result',
+      'delivering'
+    ];
+
+    if (
+      previous &&
+      activeStatuses.includes(previous.status) &&
+      Date.now() - Number(previous.createdAt || 0) <
+        12 * 60 * 60 * 1000
+    ) {
+      return {
+        ok: false,
+        error: '이전 GPT 자동회신 작업이 아직 진행 중입니다.'
+      };
+    }
+
+    returnRoute = {
+      routingVersion: CTB_RETURN_VERSION,
+      routeId: crypto.randomUUID(),
+      token: crypto.randomUUID(),
+      autoReturn: true,
+      sourceTabId: sourceAiTab.id,
+      sourceConversationUrl: conversationUrl,
+      telegramTabId: tgTab.id,
+      jobId: '',
+      sequence: '',
+      status: 'sending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      error: ''
+    };
+
+    await ctbWriteReturnRoute(returnRoute);
+  }
+
+  try {
+    const result = await sendToTab(
+      tgTab.id,
+      {
+        action: 'sendToTelegram',
+        text: aiRes.text,
+        autoSend: !!autoSend,
+        ctbReturnToken: returnRoute?.token || ''
+      }
+    );
+
+    if (returnRoute) {
+      await ctbChangeReturnRoute(
+        returnRoute.token,
+        ['sending'],
+        {
+          status:
+            result?.ok === true && result?.sent === true
+              ? 'awaiting_job'
+              : 'ambiguous',
+          error:
+            result?.ok === true && result?.sent === true
+              ? ''
+              : (result?.error || 'Telegram 전송 확인 실패')
+        }
+      );
+    }
+
+    return result;
+  } catch (error) {
+    if (returnRoute) {
+      try {
+        await ctbChangeReturnRoute(
+          returnRoute.token,
+          ['sending'],
+          {
+            status: 'ambiguous',
+            error: error?.message || 'Telegram 전송 상태 불명'
+          }
+        );
+      } catch {}
+    }
+
+    throw error;
+  }
 }
 // Telegram → AI
 async function findAiTab(aiTarget) {
@@ -938,6 +1262,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.action === 'ctbAutoReturnJob') {
+    ctbHandleReturnJob(msg, sender)
+      .then(sendResponse)
+      .catch(function(error) {
+        sendResponse({
+          ok: false,
+          error: error?.message || String(error)
+        });
+      });
+
+    return true;
+  }
+
+  if (msg.action === 'ctbAutoReturnReady') {
+    ctbHandleReturnReady(msg, sender)
+      .then(sendResponse)
+      .catch(function(error) {
+        sendResponse({
+          ok: false,
+          error: error?.message || String(error)
+        });
+      });
+
+    return true;
+  }
+
   if (msg.action === 'aiToTelegram') {
     handleAiToTelegram(
       aiTabId,
@@ -946,7 +1296,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sourceAiTabId: msg.sourceAiTabId,
         sourceAiUrl: msg.sourceAiUrl,
         sourceAiTitle: msg.sourceAiTitle
-      }
+      },
+      msg.autoReturn
     )
       .then(sendResponse)
       .catch(function(e) {
