@@ -141,21 +141,93 @@ document.addEventListener('DOMContentLoaded', function() {
     showFloatingPanelsBtn.addEventListener(
       'click',
       function() {
-        chrome.storage.local.set(
+        const showResult = function(message) {
+          if (showFloatingPanelsStatus) {
+            showFloatingPanelsStatus.textContent =
+              message;
+          }
+        };
+
+        showFloatingPanelsBtn.disabled = true;
+
+        const finish = function(message) {
+          showFloatingPanelsBtn.disabled = false;
+          showResult(message);
+        };
+
+        chrome.tabs.query(
           {
-            widgetUiState_ai:
-              'normal',
-            widgetUiState_tg:
-              'normal'
+            active: true,
+            currentWindow: true
           },
-          function() {
+          function(tabs) {
+            const queryError =
+              chrome.runtime.lastError;
+
+            const tab = tabs?.[0];
+
             if (
-              showFloatingPanelsStatus
+              queryError ||
+              !tab ||
+              !Number.isInteger(tab.id)
             ) {
-              showFloatingPanelsStatus
-                .textContent =
-                '플로팅 패널 표시 상태로 복원됨';
+              finish(
+                '현재 탭을 확인하지 못했습니다.'
+              );
+              return;
             }
+
+            let supported = false;
+
+            try {
+              const url = new URL(tab.url);
+
+              supported =
+                url.protocol === 'https:' &&
+                [
+                  'chatgpt.com',
+                  'chat.openai.com',
+                  'claude.ai',
+                  'gemini.google.com',
+                  'web.telegram.org'
+                ].includes(url.hostname);
+            } catch (error) {
+              supported = false;
+            }
+
+            if (!supported) {
+              finish(
+                '복구할 ChatGPT 또는 Telegram 탭을 먼저 선택하세요.'
+              );
+              return;
+            }
+
+            chrome.tabs.sendMessage(
+              tab.id,
+              {
+                action:
+                  'ctbRestorePanelsInThisTab'
+              },
+              function(result) {
+                const messageError =
+                  chrome.runtime.lastError;
+
+                if (
+                  messageError ||
+                  result?.ok !== true
+                ) {
+                  finish(
+                    result?.error ||
+                    '현재 탭의 패널 복구에 실패했습니다.'
+                  );
+                  return;
+                }
+
+                finish(
+                  '현재 탭의 플로팅 패널 복구 완료'
+                );
+              }
+            );
           }
         );
       }

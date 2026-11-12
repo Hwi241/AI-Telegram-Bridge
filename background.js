@@ -199,14 +199,38 @@ async function sendToTab(tabId, message) {
   }
 }
 
-async function captureChatgptCodeByCopyButton(tabId) {
-  const results =
-    await chrome.scripting.executeScript({
+async function captureChatgptCodeByCopyButton(
+  tabId,
+  copyTrigger,
+  options
+) {
+  const normalizedCopyTrigger =
+    copyTrigger === 'queued'
+      ? 'queued'
+      : 'manual';
+  const nativeWaitMs =
+    Number.isFinite(options?.nativeWaitMs)
+      ? Math.max(
+          100,
+          Math.min(
+            5000,
+            options.nativeWaitMs
+          )
+        )
+      : 5000;
+  let results;
+
+  try {
+    results =
+      await chrome.scripting.executeScript({
       target: {
         tabId: tabId
       },
       world: 'MAIN',
-      func: async function() {
+      func: async function(
+        copyTrigger,
+        nativeWaitMs
+      ) {
         const sleep =
           function(ms) {
             return new Promise(function(resolve) {
@@ -235,8 +259,14 @@ async function captureChatgptCodeByCopyButton(tabId) {
         if (!assistantCandidates.length) {
           return {
             ok: false,
+            copyTrigger: copyTrigger,
+            codeBlockFound: false,
+            copyButtonFound: false,
+            targetReady: false,
+            targetReadyElapsedMs: 0,
+            errorCode: 'CODE_BLOCK_NOT_FOUND',
             error:
-              'ChatGPT 최신 답변을 찾을 수 없습니다.'
+              'ChatGPT 코드박스를 찾지 못했습니다.'
           };
         }
 
@@ -265,8 +295,14 @@ async function captureChatgptCodeByCopyButton(tabId) {
         if (!blocks.length) {
           return {
             ok: false,
+            copyTrigger: copyTrigger,
+            codeBlockFound: false,
+            copyButtonFound: false,
+            targetReady: false,
+            targetReadyElapsedMs: 0,
+            errorCode: 'CODE_BLOCK_NOT_FOUND',
             error:
-              '최신 ChatGPT 답변에서 코드박스를 찾을 수 없습니다.'
+              'ChatGPT 코드박스를 찾지 못했습니다.'
           };
         }
 
@@ -324,32 +360,434 @@ async function captureChatgptCodeByCopyButton(tabId) {
         if (!copyButton) {
           return {
             ok: false,
+            copyTrigger: copyTrigger,
+            codeBlockFound: true,
+            copyButtonFound: false,
+            targetReady: false,
+            targetReadyElapsedMs: 0,
+            errorCode: 'COPY_BUTTON_NOT_FOUND',
             error:
-              'ChatGPT 코드박스의 복사 버튼을 찾을 수 없습니다.'
+              'ChatGPT 복사 버튼을 찾지 못했습니다.'
           };
         }
 
+        async function waitForStableCodeCopyTarget(
+          turn,
+          block,
+          copyButton
+        ) {
+          const startedAt = Date.now();
+          const deadline = startedAt + 4500;
+
+          let previousText = null;
+          let stableSince = 0;
+
+          while (Date.now() < deadline) {
+            const currentBlocks = Array.from(
+              turn.querySelectorAll(
+                '[data-markdown-copy="code-block"]'
+              )
+            ).filter(function(node) {
+              return node && node.isConnected;
+            });
+
+            const lastBlock =
+              currentBlocks[currentBlocks.length - 1];
+
+            const attached =
+              block.isConnected &&
+              copyButton.isConnected &&
+              lastBlock === block &&
+              block.contains(copyButton);
+
+            const disabled =
+              copyButton.disabled === true ||
+              copyButton.getAttribute(
+                'aria-disabled'
+              ) === 'true';
+
+            const rect =
+              copyButton.getBoundingClientRect();
+
+            const style =
+              getComputedStyle(copyButton);
+
+            const visible =
+              rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden';
+
+            const renderedText =
+              String(block.textContent || '');
+
+            const ready =
+              attached &&
+              !disabled &&
+              visible &&
+              renderedText.trim().length > 0;
+
+            if (ready) {
+              if (
+                renderedText === previousText
+              ) {
+                if (
+                  stableSince &&
+                  Date.now() - stableSince >= 700
+                ) {
+                  return {
+                    ok: true,
+                    elapsed: Date.now() - startedAt
+                  };
+                }
+              } else {
+                previousText = renderedText;
+                stableSince = Date.now();
+              }
+            } else {
+              previousText = null;
+              stableSince = 0;
+            }
+
+            await sleep(100);
+          }
+
+          return {
+            ok: false,
+            elapsed: Date.now() - startedAt,
+            error:
+              'CODE_COPY_TARGET_NOT_STABLE'
+          };
+        }
+
+        const copyTargetReady =
+          await waitForStableCodeCopyTarget(
+            turn,
+            block,
+            copyButton
+          );
+
+        if (!copyTargetReady.ok) {
+          return {
+            ok: false,
+            copyTrigger: copyTrigger,
+            codeBlockFound: true,
+            copyButtonFound: true,
+            targetReady: false,
+            targetReadyElapsedMs:
+              copyTargetReady.elapsed,
+            errorCode:
+              'CODE_COPY_TARGET_NOT_STABLE',
+            error:
+              'ChatGPT 코드박스 준비 상태를 확인하지 못했습니다.'
+          };
+        }
+
+        const targetReadyElapsedMs =
+          copyTargetReady.elapsed;
+
+        function createSourceEvidence() {
+          const codeNode =
+            block.querySelector('pre code') ||
+            block.querySelector('code') ||
+            block.querySelector('pre') ||
+            block.querySelector('.cm-content');
+
+          if (!codeNode) {
+            return {
+              fragments: [],
+              fullText: '',
+              fullTextVerified: false
+            };
+          }
+
+          const evidenceText =
+            normalize(codeNode.textContent || '');
+          const virtualized = !!block.querySelector(
+            '.cm-editor, .cm-scroller, .cm-content, .cm-line'
+          );
+          const fragments = [];
+          const addFragment = function(value) {
+            const fragment = String(value || '').trim();
+
+            if (
+              fragment.length >= 3 &&
+              !fragments.includes(fragment)
+            ) {
+              fragments.push(fragment);
+            }
+          };
+          const lines = evidenceText
+            .split('\n')
+            .filter(function(line) {
+              return line.trim().length >= 3;
+            });
+
+          if (lines.length) {
+            addFragment(lines[0]);
+            addFragment(
+              lines[Math.floor(lines.length / 2)]
+            );
+            addFragment(lines[lines.length - 1]);
+          }
+
+          if (
+            fragments.length < 2 &&
+            evidenceText.trim().length >= 16
+          ) {
+            const compact = evidenceText.trim();
+            addFragment(compact.slice(0, 8));
+            addFragment(compact.slice(-8));
+          }
+
+          return {
+            fragments: fragments.slice(0, 3),
+            fullText:
+              virtualized ? '' : evidenceText,
+            fullTextVerified:
+              !virtualized && !!evidenceText.trim()
+          };
+        }
+
+        function getCopyFeedbackState() {
+          return JSON.stringify({
+            ariaLabel:
+              copyButton.getAttribute('aria-label') || '',
+            title:
+              copyButton.getAttribute('title') || '',
+            state:
+              copyButton.getAttribute('data-state') || '',
+            pressed:
+              copyButton.getAttribute('aria-pressed') || '',
+            text: copyButton.textContent || '',
+            html: copyButton.innerHTML || ''
+          });
+        }
+
+        const sourceEvidence =
+          createSourceEvidence();
+        const feedbackStateBefore =
+          getCopyFeedbackState();
+        let copyClicked = false;
+        let copyFeedbackObserved = false;
+
         let capturedText = '';
+        let captureSource = '';
+        let captureError = '';
+        let failureCode = '';
+        let emptyCaptureObserved = false;
+        let restoreFailed = false;
+        const pendingCaptureTasks = new Set();
+        const restoreHooks = [];
+
+        function acceptCapturedText(value, source) {
+          const text = normalize(value);
+
+          if (!text.trim()) {
+            emptyCaptureObserved = true;
+            return false;
+          }
+
+          capturedText = text;
+          captureSource = source;
+
+          return true;
+        }
+
+        async function readClipboardItems(items) {
+          if (!Array.isArray(items)) {
+            return false;
+          }
+
+          for (const item of items) {
+            if (
+              !item ||
+              !Array.isArray(item.types) ||
+              !item.types.includes('text/plain') ||
+              typeof item.getType !== 'function'
+            ) {
+              continue;
+            }
+
+            try {
+              const blob =
+                await item.getType('text/plain');
+
+              if (
+                !blob ||
+                typeof blob.text !== 'function'
+              ) {
+                continue;
+              }
+
+              const value = await blob.text();
+
+              if (
+                acceptCapturedText(
+                  value,
+                  'clipboard.write'
+                )
+              ) {
+                return true;
+              }
+            } catch (error) {
+              captureError =
+                error?.message ||
+                'ClipboardItem 텍스트 읽기 실패';
+              failureCode = 'COPY_TEXT_UNVERIFIED';
+            }
+          }
+
+          return false;
+        }
+
+        function trackCaptureTask(task) {
+          const tracked = Promise.resolve(task)
+            .catch(function(error) {
+              captureError =
+                error?.message ||
+                '비동기 클립보드 읽기 실패';
+              failureCode = 'COPY_TEXT_UNVERIFIED';
+              return false;
+            })
+            .finally(function() {
+              pendingCaptureTasks.delete(tracked);
+            });
+
+          pendingCaptureTasks.add(tracked);
+          return tracked;
+        }
+
+        function hookMethod(target, key, replacement) {
+          if (
+            !target ||
+            typeof target[key] !== 'function'
+          ) {
+            return false;
+          }
+
+          const hadOwn =
+            Object.prototype.hasOwnProperty.call(
+              target,
+              key
+            );
+          const descriptor =
+            Object.getOwnPropertyDescriptor(
+              target,
+              key
+            );
+          let installed = false;
+
+          try {
+            Object.defineProperty(
+              target,
+              key,
+              {
+                configurable: true,
+                enumerable:
+                  descriptor?.enumerable === true,
+                writable: true,
+                value: replacement
+              }
+            );
+            installed = target[key] === replacement;
+          } catch (error) {
+            try {
+              target[key] = replacement;
+              installed = target[key] === replacement;
+            } catch (assignmentError) {
+              installed = false;
+            }
+          }
+
+          if (!installed) return false;
+
+          restoreHooks.push({
+            target: target,
+            key: key,
+            hadOwn: hadOwn,
+            descriptor: descriptor
+          });
+
+          return true;
+        }
+
+        function restoreClipboardHooks() {
+          for (
+            let index = restoreHooks.length - 1;
+            index >= 0;
+            index -= 1
+          ) {
+            const hook = restoreHooks[index];
+
+            try {
+              if (hook.hadOwn) {
+                Object.defineProperty(
+                  hook.target,
+                  hook.key,
+                  hook.descriptor
+                );
+              } else {
+                const removed =
+                  delete hook.target[hook.key];
+
+                if (!removed) {
+                  restoreFailed = true;
+                }
+              }
+            } catch (error) {
+              restoreFailed = true;
+            }
+          }
+        }
 
         const onCopy =
           function(event) {
             try {
-              const copied =
+              acceptCapturedText(
                 event.clipboardData?.getData(
                   'text/plain'
-                );
+                ),
+                'copy.event'
+              );
+            } catch (error) {
+              captureError =
+                error?.message ||
+                'copy 이벤트 텍스트 읽기 실패';
+            }
+          };
 
-              if (copied) {
-                capturedText =
-                  normalize(copied);
-              }
-            } catch (e) {}
+        const onCopyCapture =
+          function(event) {
+            trackCaptureTask(
+              Promise.resolve().then(function() {
+                try {
+                  return acceptCapturedText(
+                    event.clipboardData?.getData(
+                      'text/plain'
+                    ),
+                    'copy.event'
+                  );
+                } catch (error) {
+                  captureError =
+                    error?.message ||
+                    'copy 이벤트 텍스트 읽기 실패';
+                  return false;
+                }
+              })
+            );
           };
 
         document.addEventListener(
           'copy',
-          onCopy,
+          onCopyCapture,
           true
+        );
+
+        document.addEventListener(
+          'copy',
+          onCopy,
+          false
         );
 
         const clipboard =
@@ -362,95 +800,702 @@ async function captureChatgptCodeByCopyButton(tabId) {
               )
             : null;
 
-        const originalWriteText =
-          clipboardProto &&
-          typeof clipboardProto.writeText ===
-            'function'
-            ? clipboardProto.writeText
-            : null;
+        const writeTextHook = function(value) {
+          acceptCapturedText(
+            value,
+            'clipboard.writeText'
+          );
 
-        let writeHooked = false;
+          return Promise.resolve();
+        };
 
-        if (
-          clipboardProto &&
-          originalWriteText
-        ) {
-          try {
-            clipboardProto.writeText =
-              function(value) {
-                capturedText =
-                  normalize(value);
+        const writeHook = function(items) {
+          return trackCaptureTask(
+            readClipboardItems(items)
+          );
+        };
 
-                return Promise.resolve();
-              };
+        const writeTextHooked =
+          hookMethod(
+            clipboard,
+            'writeText',
+            writeTextHook
+          ) ||
+          hookMethod(
+            clipboardProto,
+            'writeText',
+            writeTextHook
+          );
 
-            writeHooked = true;
-          } catch (e) {}
-        }
+        const writeHooked =
+          hookMethod(
+            clipboard,
+            'write',
+            writeHook
+          ) ||
+          hookMethod(
+            clipboardProto,
+            'write',
+            writeHook
+          );
 
         try {
-          copyButton.click();
+          try {
+            copyButton.click();
+            copyClicked = true;
+          } catch (error) {
+            failureCode = 'COPY_EXCEPTION';
+            captureError =
+              error?.message ||
+              '복사 버튼 클릭 실패';
+          }
 
           const deadline =
-            Date.now() + 1500;
+            Date.now() + nativeWaitMs;
 
           while (
             !capturedText &&
+            failureCode !== 'COPY_EXCEPTION' &&
             Date.now() < deadline
           ) {
-            await sleep(50);
+            if (
+              getCopyFeedbackState() !==
+              feedbackStateBefore
+            ) {
+              copyFeedbackObserved = true;
+            }
+
+            if (pendingCaptureTasks.size) {
+              await Promise.race([
+                Promise.allSettled(
+                  Array.from(pendingCaptureTasks)
+                ),
+                sleep(50)
+              ]);
+            } else {
+              await sleep(50);
+            }
           }
         } finally {
           document.removeEventListener(
             'copy',
-            onCopy,
+            onCopyCapture,
             true
           );
 
-          if (
-            writeHooked &&
-            clipboardProto &&
-            originalWriteText
-          ) {
-            try {
-              clipboardProto.writeText =
-                originalWriteText;
-            } catch (e) {}
-          }
+          document.removeEventListener(
+            'copy',
+            onCopy,
+            false
+          );
+
+          restoreClipboardHooks();
+        }
+
+        if (restoreFailed) {
+          return {
+            ok: false,
+            copyTrigger: copyTrigger,
+            codeBlockFound: true,
+            copyButtonFound: true,
+            targetReady: true,
+            targetReadyElapsedMs:
+              targetReadyElapsedMs,
+            copyClicked: copyClicked,
+            copyFeedbackObserved:
+              copyFeedbackObserved,
+            sourceEvidence: sourceEvidence,
+            errorCode: 'COPY_EXCEPTION',
+            captureSource: captureSource,
+            capturedLength: capturedText.length,
+            error:
+              '코드 복사 처리를 안전하게 복원하지 못했습니다.'
+          };
         }
 
         if (!capturedText) {
+          const unsupported =
+            !writeTextHooked &&
+            !writeHooked;
+          const errorCode =
+            failureCode ||
+            (
+              unsupported
+                ? 'COPY_API_UNSUPPORTED'
+                : emptyCaptureObserved
+                  ? 'COPY_TEXT_EMPTY'
+                : captureError
+                  ? 'COPY_TEXT_UNVERIFIED'
+                  : 'COPY_TIMEOUT'
+            );
+          const error =
+            errorCode === 'COPY_API_UNSUPPORTED'
+              ? '코드 복사 API를 확인하지 못했습니다.'
+              : errorCode === 'COPY_TEXT_EMPTY'
+                ? '코드 복사 결과가 비어 있어 전송하지 않았습니다.'
+              : errorCode === 'COPY_TEXT_UNVERIFIED'
+                ? '코드 원문 전체를 확인하지 못해 전송하지 않았습니다.'
+                : errorCode === 'COPY_EXCEPTION'
+                  ? 'ChatGPT 코드 복사 중 오류가 발생했습니다.'
+                  : '코드 복사 결과를 확인하지 못했습니다.';
+
           return {
             ok: false,
-            error:
-              'ChatGPT 복사 버튼은 눌렀지만 전체 코드 값을 가져오지 못했습니다.'
+            copyTrigger: copyTrigger,
+            codeBlockFound: true,
+            copyButtonFound: true,
+            targetReady: true,
+            targetReadyElapsedMs:
+              targetReadyElapsedMs,
+            copyClicked: copyClicked,
+            copyFeedbackObserved:
+              copyFeedbackObserved,
+            sourceEvidence: sourceEvidence,
+            errorCode: errorCode,
+            captureSource: captureSource,
+            capturedLength: 0,
+            captureError: captureError,
+            error: error
           };
         }
 
         return {
           ok: true,
-          text: capturedText
+          text: capturedText,
+          copyTrigger: copyTrigger,
+          codeBlockFound: true,
+          copyButtonFound: true,
+          targetReady: true,
+          targetReadyElapsedMs:
+            targetReadyElapsedMs,
+          copyClicked: copyClicked,
+          copyFeedbackObserved:
+            copyFeedbackObserved,
+          sourceEvidence: sourceEvidence,
+          errorCode: '',
+          captureSource: captureSource,
+          capturedLength: capturedText.length,
+          domFallbackUsed: false
         };
-      }
+      },
+      args: [
+        normalizedCopyTrigger,
+        nativeWaitMs
+      ]
     });
+  } catch (error) {
+    console.warn('[CTB native code copy]', {
+      stage: 'execute_script',
+      copyTrigger: normalizedCopyTrigger,
+      codeBlockFound: false,
+      copyButtonFound: false,
+      targetReady: false,
+      targetReadyElapsedMs: 0,
+      captureSource: '',
+      capturedLength: 0,
+      failureCode: 'COPY_EXCEPTION'
+    });
+
+    throw new Error(
+      'ChatGPT 코드 복사 중 오류가 발생했습니다.'
+    );
+  }
 
   const result =
     results?.[0]?.result;
 
   if (!result?.ok) {
-    throw new Error(
+    console.warn('[CTB native code copy]', {
+      stage: 'capture',
+      copyTrigger:
+        result?.copyTrigger ||
+        normalizedCopyTrigger,
+      codeBlockFound:
+        result?.codeBlockFound === true,
+      copyButtonFound:
+        result?.copyButtonFound === true,
+      targetReady:
+        result?.targetReady === true,
+      targetReadyElapsedMs:
+        Number(
+          result?.targetReadyElapsedMs || 0
+        ),
+      captureSource: result?.captureSource || '',
+      capturedLength:
+        Number(result?.capturedLength || 0),
+      failureCode:
+        result?.errorCode || 'COPY_EXCEPTION'
+    });
+
+    const captureFailure = new Error(
       result?.error ||
       'ChatGPT 코드 복사에 실패했습니다.'
     );
+
+    captureFailure.ctbNativeCopy = result || null;
+
+    throw captureFailure;
   }
 
-  return result.text;
+  console.info('[CTB native code copy]', {
+    stage: 'capture',
+    copyTrigger:
+      result.copyTrigger ||
+      normalizedCopyTrigger,
+    nativeCaptureSucceeded: true,
+    nativeCopyClicked:
+      result.copyClicked === true,
+    copyFeedbackObserved:
+      result.copyFeedbackObserved === true,
+    clipboardReadBeforeSucceeded: null,
+    clipboardReadAfterSucceeded: null,
+    clipboardChanged: null,
+    sourceEvidenceMatched: null,
+    codeBlockFound:
+      result.codeBlockFound === true,
+    copyButtonFound:
+      result.copyButtonFound === true,
+    targetReady:
+      result.targetReady === true,
+    targetReadyElapsedMs:
+      Number(
+        result.targetReadyElapsedMs || 0
+      ),
+    captureSource: result.captureSource || '',
+    capturedLength: Number(result.capturedLength || 0),
+    failureCode: ''
+  });
+
+  return {
+    text: result.text,
+    details: result
+  };
+}
+
+async function ctbReadChatgptClipboardText(
+  tabId,
+  timeoutMs
+) {
+  const readTimeoutMs =
+    Number.isFinite(timeoutMs)
+      ? Math.max(
+          100,
+          Math.min(5000, timeoutMs)
+        )
+      : 5000;
+
+  try {
+    const results =
+      await chrome.scripting.executeScript({
+        target: {
+          tabId: tabId
+        },
+        world: 'ISOLATED',
+        func: async function(readTimeoutMs) {
+          if (
+            !navigator.clipboard ||
+            typeof navigator.clipboard.readText !==
+              'function'
+          ) {
+            return {
+              ok: false,
+              code: 'CLIPBOARD_READ_UNAVAILABLE'
+            };
+          }
+
+          try {
+            const text =
+              await Promise.race([
+                navigator.clipboard.readText(),
+                new Promise(function(
+                  resolve,
+                  reject
+                ) {
+                  setTimeout(function() {
+                    reject(
+                      new Error(
+                        'CLIPBOARD_READ_TIMEOUT'
+                      )
+                    );
+                  }, readTimeoutMs);
+                })
+              ]);
+
+            return {
+              ok: true,
+              text: String(text ?? '')
+            };
+          } catch (error) {
+            return {
+              ok: false,
+              code:
+                error?.message ===
+                  'CLIPBOARD_READ_TIMEOUT'
+                  ? 'CLIPBOARD_READ_TIMEOUT'
+                  : 'CLIPBOARD_READ_DENIED',
+              errorName:
+                String(error?.name || '')
+            };
+          }
+        },
+        args: [readTimeoutMs]
+      });
+
+    return results?.[0]?.result || {
+      ok: false,
+      code: 'CLIPBOARD_READ_NO_RESULT'
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'CLIPBOARD_READ_EXCEPTION',
+      errorName:
+        String(error?.name || '')
+    };
+  }
+}
+
+function ctbNormalizeClipboardText(value) {
+  return String(value ?? '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+}
+
+function ctbVerifyClipboardSource(text, evidence) {
+  const normalized =
+    ctbNormalizeClipboardText(text);
+  const fragments = Array.isArray(evidence?.fragments)
+    ? evidence.fragments
+        .map(ctbNormalizeClipboardText)
+        .filter(function(fragment) {
+          return fragment.trim().length >= 3;
+        })
+    : [];
+  const fragmentsMatched =
+    fragments.length >= 2 &&
+    fragments.every(function(fragment) {
+      return normalized.includes(fragment);
+    });
+  const fullText =
+    ctbNormalizeClipboardText(
+      evidence?.fullText || ''
+    );
+  const fullTextMatched = !!(
+    evidence?.fullTextVerified === true &&
+    fullText.trim() &&
+    normalized === fullText
+  );
+
+  return {
+    matched:
+      fullTextMatched || fragmentsMatched,
+    fullTextMatched: fullTextMatched,
+    fragmentsMatched: fragmentsMatched
+  };
+}
+
+function ctbClipboardFailureMessage(code) {
+  if (code === 'CLIPBOARD_READ_DENIED') {
+    return '클립보드 읽기 권한이 없어 코드를 확인하지 못했습니다. [CLIPBOARD_READ_DENIED]';
+  }
+
+  if (
+    code === 'CLIPBOARD_READ_UNAVAILABLE' ||
+    code === 'CLIPBOARD_READ_TIMEOUT' ||
+    code === 'CLIPBOARD_READ_NO_RESULT' ||
+    code === 'CLIPBOARD_READ_EXCEPTION'
+  ) {
+    return '코드 복사 결과를 확인하지 못했습니다. [' + code + ']';
+  }
+
+  if (code === 'CLIPBOARD_EMPTY') {
+    return '클립보드의 코드 복사 결과가 비어 있습니다. [CLIPBOARD_EMPTY]';
+  }
+
+  if (code === 'CLIPBOARD_UNCHANGED_UNVERIFIED') {
+    return '변경되지 않은 클립보드가 현재 코드박스의 결과인지 확인하지 못했습니다. [CLIPBOARD_UNCHANGED_UNVERIFIED]';
+  }
+
+  return '코드는 복사됐지만 현재 코드박스와의 일치를 확인하지 못했습니다. [CLIPBOARD_SOURCE_UNVERIFIED]';
+}
+
+let ctbChatgptCodeCaptureBusy = false;
+
+function ctbTransferNow() {
+  return (
+    typeof performance !== 'undefined' &&
+    typeof performance.now === 'function'
+  )
+    ? performance.now()
+    : Date.now();
+}
+
+async function ctbCaptureChatgptCodeWithFallback(
+  sourceAiTab,
+  copyTrigger,
+  timing
+) {
+  const normalizedCopyTrigger =
+    copyTrigger === 'queued'
+      ? 'queued'
+      : 'manual';
+
+  if (ctbChatgptCodeCaptureBusy) {
+    throw new Error(
+      '다른 ChatGPT 코드 복사 요청을 처리 중입니다.'
+    );
+  }
+
+  ctbChatgptCodeCaptureBusy = true;
+
+  let before = null;
+  let nativeFailure = null;
+
+  try {
+    const beforeStartedAt = ctbTransferNow();
+
+    before =
+      await ctbReadChatgptClipboardText(
+        sourceAiTab.id,
+        1200
+      );
+
+    timing.clipboardBeforeMs =
+      ctbTransferNow() - beforeStartedAt;
+
+    const nativeStartedAt = ctbTransferNow();
+
+    try {
+      const nativeResult =
+        await captureChatgptCodeByCopyButton(
+        sourceAiTab.id,
+        normalizedCopyTrigger,
+        {
+          nativeWaitMs:
+            before?.ok === true
+              ? 650
+              : 5000
+        }
+      );
+
+      timing.copyTargetReadyMs = Number(
+        nativeResult?.details
+          ?.targetReadyElapsedMs || 0
+      );
+      timing.nativeCaptureMs = Math.max(
+        0,
+        ctbTransferNow() - nativeStartedAt -
+          timing.copyTargetReadyMs
+      );
+
+      return nativeResult.text;
+    } catch (error) {
+      nativeFailure = error?.ctbNativeCopy || null;
+
+      timing.copyTargetReadyMs = Number(
+        nativeFailure?.targetReadyElapsedMs || 0
+      );
+      timing.nativeCaptureMs = Math.max(
+        0,
+        ctbTransferNow() - nativeStartedAt -
+          timing.copyTargetReadyMs
+      );
+
+      const fallbackCodes = [
+        'COPY_API_UNSUPPORTED',
+        'COPY_TEXT_EMPTY',
+        'COPY_TIMEOUT',
+        'COPY_TEXT_UNVERIFIED'
+      ];
+
+      if (
+        !nativeFailure ||
+        nativeFailure.codeBlockFound !== true ||
+        nativeFailure.copyButtonFound !== true ||
+        nativeFailure.targetReady !== true ||
+        nativeFailure.copyClicked !== true ||
+        !fallbackCodes.includes(
+          nativeFailure.errorCode
+        )
+      ) {
+        throw error;
+      }
+    }
+
+    const afterStartedAt = ctbTransferNow();
+    const afterDeadline = afterStartedAt + 2000;
+    let after = null;
+
+    while (ctbTransferNow() < afterDeadline) {
+      const remaining =
+        afterDeadline - ctbTransferNow();
+
+      after =
+        await ctbReadChatgptClipboardText(
+          sourceAiTab.id,
+          Math.min(1500, remaining)
+        );
+
+      if (!after?.ok) break;
+
+      const currentAfterText =
+        ctbNormalizeClipboardText(after.text);
+      const currentBeforeText = before?.ok
+        ? ctbNormalizeClipboardText(before.text)
+        : '';
+      const currentVerification =
+        ctbVerifyClipboardSource(
+          currentAfterText,
+          nativeFailure?.sourceEvidence
+        );
+      const unchangedVerified =
+        currentVerification.fullTextMatched ||
+        (
+          nativeFailure?.copyFeedbackObserved === true &&
+          currentVerification.fragmentsMatched
+        );
+
+      if (
+        currentAfterText !== currentBeforeText ||
+        unchangedVerified
+      ) {
+        break;
+      }
+
+      await new Promise(function(resolve) {
+        setTimeout(resolve, 125);
+      });
+    }
+
+    timing.clipboardAfterMs =
+      ctbTransferNow() - afterStartedAt;
+
+    const currentTab =
+      await chrome.tabs.get(sourceAiTab.id);
+
+    if (
+      !currentTab ||
+      !isAiSourceUrl(currentTab.url) ||
+      normalizeTabSourceUrl(currentTab.url) !==
+        normalizeTabSourceUrl(sourceAiTab.url)
+    ) {
+      throw new Error(
+        '코드 복사 중 원본 ChatGPT 대화가 변경되었습니다.'
+      );
+    }
+
+    let failureCode = '';
+
+    if (!before?.ok) {
+      failureCode =
+        before?.code ||
+        'CLIPBOARD_READ_NO_RESULT';
+    } else if (!after?.ok) {
+      failureCode =
+        after?.code ||
+        'CLIPBOARD_READ_NO_RESULT';
+    }
+
+    const beforeText = before?.ok
+      ? ctbNormalizeClipboardText(before.text)
+      : '';
+    const afterText = after?.ok
+      ? ctbNormalizeClipboardText(after.text)
+      : '';
+    const clipboardChanged = !!(
+      before?.ok &&
+      after?.ok &&
+      beforeText !== afterText
+    );
+    const verificationStartedAt =
+      ctbTransferNow();
+    const sourceVerification =
+      ctbVerifyClipboardSource(
+        afterText,
+        nativeFailure?.sourceEvidence
+      );
+
+    if (
+      !failureCode &&
+      !afterText.trim()
+    ) {
+      failureCode = 'CLIPBOARD_EMPTY';
+    }
+
+    if (!failureCode) {
+      if (clipboardChanged) {
+        if (!sourceVerification.matched) {
+          failureCode =
+            'CLIPBOARD_SOURCE_UNVERIFIED';
+        }
+      } else if (
+        !sourceVerification.fullTextMatched &&
+        !(
+          nativeFailure?.copyFeedbackObserved === true &&
+          sourceVerification.fragmentsMatched
+        )
+      ) {
+        failureCode =
+          'CLIPBOARD_UNCHANGED_UNVERIFIED';
+      }
+    }
+
+    timing.sourceVerificationMs =
+      ctbTransferNow() - verificationStartedAt;
+
+    console.info('[CTB clipboard fallback]', {
+      copyTrigger: normalizedCopyTrigger,
+      nativeCaptureSucceeded: false,
+      nativeCopyClicked:
+        nativeFailure?.copyClicked === true,
+      copyFeedbackObserved:
+        nativeFailure?.copyFeedbackObserved === true,
+      clipboardReadBeforeSucceeded:
+        before?.ok === true,
+      clipboardReadAfterSucceeded:
+        after?.ok === true,
+      clipboardChanged: clipboardChanged,
+      sourceEvidenceMatched:
+        sourceVerification.matched,
+      capturedLength:
+        failureCode ? 0 : afterText.length,
+      failureCode: failureCode
+    });
+
+    if (failureCode) {
+      throw new Error(
+        ctbClipboardFailureMessage(
+          failureCode
+        )
+      );
+    }
+
+    return String(after.text ?? '');
+  } finally {
+    ctbChatgptCodeCaptureBusy = false;
+  }
 }
 
 const CTB_RETURN_VERSION = '061-8';
 const CTB_RETURN_KEY = 'bridge_auto_return_routes';
+const CTB_AUTO_RETURN_WATCH_ALARM =
+  'ctb-auto-return-watch-061';
+const CTB_AUTO_RETURN_WATCH_STATUSES = new Set([
+  'sending',
+  'awaiting_job',
+  'awaiting_result'
+]);
 
 let ctbReturnDeliveryBusy = false;
+let ctbReturnMutationTail = Promise.resolve();
+
+function ctbQueueReturnMutation(operation) {
+  const pending = ctbReturnMutationTail.then(operation, operation);
+
+  ctbReturnMutationTail = pending.catch(function() {});
+
+  return pending;
+}
 
 function ctbReturnConversationUrl(value) {
   try {
@@ -499,6 +1544,120 @@ async function ctbWriteReturnRoute(route) {
   await chrome.storage.local.set({
     [CTB_RETURN_KEY]: [...retained, route]
   });
+
+  await ctbSyncReturnWatchAlarm(route);
+}
+
+async function ctbSyncReturnWatchAlarm(route) {
+  if (!chrome.alarms) return;
+
+  const current = route || await ctbReadReturnRoute();
+  const active = !!(
+    current &&
+    CTB_AUTO_RETURN_WATCH_STATUSES.has(current.status)
+  );
+
+  if (active) {
+    chrome.alarms.create(
+      CTB_AUTO_RETURN_WATCH_ALARM,
+      { periodInMinutes: 0.5 }
+    );
+    return;
+  }
+
+  await chrome.alarms.clear(
+    CTB_AUTO_RETURN_WATCH_ALARM
+  );
+}
+
+async function ctbHandleReturnWatchAlarm() {
+  const route = await ctbReadReturnRoute();
+
+  if (
+    !route ||
+    !CTB_AUTO_RETURN_WATCH_STATUSES.has(route.status)
+  ) {
+    await ctbSyncReturnWatchAlarm(route);
+    return;
+  }
+
+  let tab;
+
+  try {
+    tab = await chrome.tabs.get(route.telegramTabId);
+  } catch {
+    tab = null;
+  }
+
+  if (
+    !tab ||
+    tab.discarded === true ||
+    !isTelegramDestinationUrl(tab.url)
+  ) {
+    await ctbChangeReturnRoute(
+      route.token,
+      [route.status],
+      {
+        phase: 'telegram_watch_failed',
+        diagnostic: 'telegram_tab_unavailable',
+        diagnosticAt: Date.now()
+      }
+    );
+    return;
+  }
+
+  try {
+    const result = await chrome.tabs.sendMessage(
+      tab.id,
+      {
+        action: 'ctbAutoReturnWatch',
+        token: route.token
+      }
+    );
+
+    await ctbChangeReturnRoute(
+      route.token,
+      [route.status],
+      {
+        phase: result?.ok
+          ? 'telegram_watch_ok'
+          : 'telegram_watch_failed',
+        diagnostic: result?.ok
+          ? ''
+          : (result?.error || 'telegram_watch_unconfirmed'),
+        diagnosticAt: Date.now(),
+        telegramDocumentHidden:
+          result?.documentHidden === true,
+        telegramVisibilityState:
+          String(result?.visibilityState || '')
+      }
+    );
+
+    console.info('[CTB auto return watch]', {
+      phase: result?.ok
+        ? 'telegram_watch_ok'
+        : 'telegram_watch_failed',
+      jobId: route.jobId || '',
+      candidateCount:
+        Number(result?.candidateCount || 0),
+      documentHidden:
+        result?.documentHidden === true,
+      visibilityState:
+        String(result?.visibilityState || ''),
+      status: route.status
+    });
+  } catch (error) {
+    await ctbChangeReturnRoute(
+      route.token,
+      [route.status],
+      {
+        phase: 'telegram_watch_failed',
+        diagnostic:
+          error?.message || 'telegram_watch_failed',
+        diagnosticAt: Date.now()
+      }
+    );
+  }
 }
 
 async function ctbChangeReturnRoute(token, allowedStatuses, patch) {
@@ -553,9 +1712,10 @@ async function ctbHandleReturnJob(message, sender) {
   const updated = await ctbChangeReturnRoute(
     message.token,
     ['sending', 'awaiting_job'],
-    {
-      status: 'awaiting_result',
-      jobId: message.jobId
+      {
+        status: 'awaiting_result',
+        jobId: message.jobId,
+        phase: 'waiting_begin_or_ready'
     }
   );
 
@@ -581,23 +1741,39 @@ async function ctbHandleReturnReady(message, sender) {
     return { ok: false, error: 'Job 또는 종료 신호 불일치' };
   }
 
-  if (
-    message.candidateCount !== 1 ||
-    typeof message.text !== 'string' ||
-    !message.text.trim()
-  ) {
+  const candidateCount = Number(message.candidateCount);
+  const textValid =
+    typeof message.text === 'string' &&
+    !!message.text.trim() &&
+    message.text.length <= 250000;
+  const legacyValid =
+    message.beginSeen !== true &&
+    candidateCount === 1 &&
+    message.readyJobId === route.jobId;
+  const boundedValid =
+    message.beginSeen === true &&
+    message.beginJobId === route.jobId &&
+    message.readyJobId === route.jobId &&
+    message.beginSequence === message.sequence &&
+    /^R[1-9]\d*$/.test(message.beginSequence || '') &&
+    Number.isSafeInteger(candidateCount) &&
+    candidateCount >= 1 &&
+    candidateCount <= 200;
+
+  if (!textValid || (!legacyValid && !boundedValid)) {
     await ctbChangeReturnRoute(
       route.token,
       ['awaiting_result'],
       {
         status: 'ambiguous',
-        error: '완료보고 후보가 정확히 1개가 아님'
+        error: '완료보고 경계 또는 후보 검증 실패',
+        phase: 'report_merge_failed'
       }
     );
 
     return {
       ok: false,
-      error: '후보 개수 불확실 · 수동 전달 필요'
+      error: '완료보고 검증 실패 · 수동 전달 필요'
     };
   }
 
@@ -610,7 +1786,8 @@ async function ctbHandleReturnReady(message, sender) {
       {
         status: 'delivering',
         sequence: message.sequence,
-        claimedAt: Date.now()
+        claimedAt: Date.now(),
+        phase: 'gpt_target_connecting'
       }
     );
 
@@ -647,6 +1824,13 @@ async function ctbHandleReturnReady(message, sender) {
       {
         status: sent ? 'delivered' : 'delivery_failed',
         error: sent ? '' : (result?.error || 'ChatGPT 전송 미확인'),
+        phase: sent
+          ? 'gpt_send_success'
+          : (result?.phase || 'gpt_send_failed'),
+        gptDocumentHidden:
+          result?.documentHidden === true,
+        gptVisibilityState:
+          String(result?.visibilityState || ''),
         completedAt: Date.now()
       }
     );
@@ -662,7 +1846,8 @@ async function ctbHandleReturnReady(message, sender) {
         ['delivering'],
         {
           status: 'ambiguous',
-          error: error?.message || '전달 상태 확인 실패'
+          error: error?.message || '전달 상태 확인 실패',
+          phase: 'gpt_target_failed'
         }
       );
     } catch {}
@@ -676,13 +1861,130 @@ async function ctbHandleReturnReady(message, sender) {
   }
 }
 
+async function ctbHandleReturnCancel(message, sender) {
+  const route = await ctbReadReturnRoute();
+  let senderIsChatgpt = false;
+
+  try {
+    const senderUrl = new URL(sender?.tab?.url || '');
+
+    senderIsChatgpt = !!(
+      sender?.tab &&
+      Number.isInteger(sender.tab.id) &&
+      senderUrl.protocol === 'https:' &&
+      ['chatgpt.com', 'chat.openai.com'].includes(
+        senderUrl.hostname
+      )
+    );
+  } catch {}
+
+  if (
+    !route ||
+    !senderIsChatgpt ||
+    message.routeId !== route.routeId ||
+    route.routingVersion !== CTB_RETURN_VERSION ||
+    route.autoReturn !== true
+  ) {
+    return { ok: false, error: '자동회신 예약 검증 실패' };
+  }
+
+  const updated = await ctbChangeReturnRoute(
+    route.token,
+    ['sending', 'awaiting_job', 'awaiting_result'],
+    {
+      status: 'cancelled',
+      phase: 'cancelled_by_user',
+      error: '',
+      completedAt: Date.now()
+    }
+  );
+
+  return {
+    ok: !!updated,
+    status: updated?.status || route.status || '',
+    error: updated
+      ? ''
+      : '이미 전달이 시작되었거나 취소할 수 없습니다.'
+  };
+}
+
+async function ctbGetAutoReturnCancelState(sender) {
+  const route = await ctbReadReturnRoute();
+  let senderIsChatgpt = false;
+
+  try {
+    const senderUrl = new URL(sender?.tab?.url || '');
+
+    senderIsChatgpt = !!(
+      sender?.tab &&
+      Number.isInteger(sender.tab.id) &&
+      senderUrl.protocol === 'https:' &&
+      ['chatgpt.com', 'chat.openai.com'].includes(
+        senderUrl.hostname
+      )
+    );
+  } catch {}
+
+  const routeMatches = !!(
+    route &&
+    senderIsChatgpt &&
+    route.routingVersion === CTB_RETURN_VERSION &&
+    route.autoReturn === true
+  );
+  const canCancel = !!(
+    routeMatches &&
+    ['sending', 'awaiting_job', 'awaiting_result'].includes(route.status)
+  );
+
+  return {
+    ok: true,
+    canCancel: canCancel,
+    routeId: canCancel ? route.routeId : '',
+    status: routeMatches ? String(route.status || '') : '',
+    updatedAt: routeMatches
+      ? Number(route.updatedAt || 0)
+      : 0
+  };
+}
+
+ctbSyncReturnWatchAlarm().catch(function() {});
+
 // AI → Telegram
 async function handleAiToTelegram(
   senderTabId,
   autoSend,
   sourceRequest,
-  autoReturn
+  autoReturn,
+  copyTrigger
 ) {
+  const transferStartedAt = ctbTransferNow();
+  const transferTiming = {
+    trigger:
+      copyTrigger === 'queued'
+        ? 'queued'
+        : 'manual',
+    clipboardBeforeMs: 0,
+    copyTargetReadyMs: 0,
+    nativeCaptureMs: 0,
+    clipboardAfterMs: 0,
+    sourceVerificationMs: 0,
+    telegramTransferMs: 0,
+    totalTransferMs: 0
+  };
+  let transferTimingLogged = false;
+  const logTransferTiming = function(result) {
+    if (transferTimingLogged) return;
+
+    transferTimingLogged = true;
+    transferTiming.totalTransferMs =
+      ctbTransferNow() - transferStartedAt;
+
+    console.info('[CTB transfer timing]', {
+      ...transferTiming,
+      result: result
+    });
+  };
+
   const sourceAiTab =
     await resolveAiSourceTab(
       sourceRequest,
@@ -764,11 +2066,15 @@ async function handleAiToTelegram(
       aiRes = {
         ...aiRes,
         text:
-          await captureChatgptCodeByCopyButton(
-            sourceAiTab.id
+          await ctbCaptureChatgptCodeWithFallback(
+            sourceAiTab,
+            copyTrigger,
+            transferTiming
           )
       };
     } catch (e) {
+      logTransferTiming('failure');
+
       return {
         ok: false,
         error:
@@ -795,6 +2101,8 @@ async function handleAiToTelegram(
       tgTab.url
     )
   ) {
+    logTransferTiming('failure');
+
     return {
       ok: false,
       error:
@@ -859,7 +2167,10 @@ async function handleAiToTelegram(
     await ctbWriteReturnRoute(returnRoute);
   }
 
+  let telegramStartedAt = 0;
+
   try {
+    telegramStartedAt = ctbTransferNow();
     const result = await sendToTab(
       tgTab.id,
       {
@@ -869,6 +2180,9 @@ async function handleAiToTelegram(
         ctbReturnToken: returnRoute?.token || ''
       }
     );
+
+    transferTiming.telegramTransferMs =
+      ctbTransferNow() - telegramStartedAt;
 
     if (returnRoute) {
       await ctbChangeReturnRoute(
@@ -887,8 +2201,21 @@ async function handleAiToTelegram(
       );
     }
 
+    logTransferTiming(
+      result?.ok === true
+        ? 'success'
+        : 'failure'
+    );
+
     return result;
   } catch (error) {
+    if (telegramStartedAt) {
+      transferTiming.telegramTransferMs =
+        ctbTransferNow() - telegramStartedAt;
+    }
+
+    logTransferTiming('failure');
+
     if (returnRoute) {
       try {
         await ctbChangeReturnRoute(
@@ -1138,6 +2465,13 @@ if (chrome.alarms && chrome.alarms.onAlarm) {
     if (alarm && alarm.name === DEEPSEEK_BALANCE_ALARM) {
       fetchDeepSeekBalance().catch(function() {});
     }
+
+    if (
+      alarm &&
+      alarm.name === CTB_AUTO_RETURN_WATCH_ALARM
+    ) {
+      ctbHandleReturnWatchAlarm().catch(function() {});
+    }
   });
 }
 
@@ -1263,7 +2597,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'ctbAutoReturnJob') {
-    ctbHandleReturnJob(msg, sender)
+    ctbQueueReturnMutation(function() {
+      return ctbHandleReturnJob(msg, sender);
+    })
       .then(sendResponse)
       .catch(function(error) {
         sendResponse({
@@ -1276,11 +2612,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'ctbAutoReturnReady') {
-    ctbHandleReturnReady(msg, sender)
+    ctbQueueReturnMutation(function() {
+      return ctbHandleReturnReady(msg, sender);
+    })
       .then(sendResponse)
       .catch(function(error) {
         sendResponse({
           ok: false,
+          error: error?.message || String(error)
+        });
+      });
+
+    return true;
+  }
+
+  if (msg.action === 'ctbAutoReturnCancel') {
+    ctbQueueReturnMutation(function() {
+      return ctbHandleReturnCancel(msg, sender);
+    })
+      .then(sendResponse)
+      .catch(function(error) {
+        sendResponse({
+          ok: false,
+          error: error?.message || String(error)
+        });
+      });
+
+    return true;
+  }
+
+  if (msg.action === 'ctbGetAutoReturnCancelState') {
+    ctbGetAutoReturnCancelState(sender)
+      .then(sendResponse)
+      .catch(function(error) {
+        sendResponse({
+          ok: false,
+          canCancel: false,
+          routeId: '',
+          status: '',
           error: error?.message || String(error)
         });
       });
@@ -1297,7 +2666,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sourceAiUrl: msg.sourceAiUrl,
         sourceAiTitle: msg.sourceAiTitle
       },
-      msg.autoReturn
+      msg.autoReturn,
+      msg.copyTrigger
     )
       .then(sendResponse)
       .catch(function(e) {

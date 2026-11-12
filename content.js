@@ -6,7 +6,7 @@ window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__ = true;
 
 // content.js v5.0
 // Claude, ChatGPT, Gemini, Telegram 범용 지원
-const CTB_RUNTIME_BUILD = '061-8';
+const CTB_RUNTIME_BUILD = '061-13h';
 
 console.log(
   '[CTB] content runtime ' +
@@ -1474,6 +1474,40 @@ function chatgpt_pasteOnce(
  );
 }
 
+function chatgpt_pasteAutoReturnOnce(
+ input,
+ expectedText
+) {
+ if (!input || !input.isConnected) {
+ return false;
+ }
+
+ try {
+ input.focus({ preventScroll: true });
+ } catch (error) {
+ input.focus();
+ }
+
+ const doc = input.ownerDocument || document;
+ const view = doc.defaultView || window;
+ const selection = view.getSelection();
+
+ if (!selection) {
+ return false;
+ }
+
+ const range = doc.createRange();
+ range.selectNodeContents(input);
+ range.collapse(false);
+ selection.removeAllRanges();
+ selection.addRange(range);
+
+ return dispatchPasteText(
+ input,
+ expectedText
+ );
+}
+
 function chatgpt_getComparableText(
  text
 ) {
@@ -1582,7 +1616,8 @@ function chatgpt_waitForReadyAndSend(
  expectedText,
  timeoutMs,
  changeTracker,
- expectedConversationUrl
+ expectedConversationUrl,
+ requireExactText
 ) {
  return new Promise(function(resolve) {
  const anchors =
@@ -1876,6 +1911,36 @@ function chatgpt_waitForReadyAndSend(
  return;
  }
 
+ if (requireExactText === true) {
+ const latestText =
+ chatgpt_normalizeComposerText(
+ getContentEditablePlainText(latestInput)
+ );
+
+ if (
+ latestAttachmentState.count >
+ initialAttachmentCount
+ ) {
+ finish({
+ ok: false,
+ sent: false,
+ phase: 'gpt_input_failed',
+ error: '자동회신 원문 완전성을 확인할 수 없음'
+ });
+ return;
+ }
+
+ if (latestText !== expectedText) {
+ finish({
+ ok: false,
+ sent: false,
+ phase: 'gpt_input_failed',
+ error: '자동회신 입력 원문 불일치'
+ });
+ return;
+ }
+ }
+
  if (
  expectedConversationUrl &&
  normalizeAutoReturnConversationUrl(location.href) !==
@@ -2008,7 +2073,8 @@ function chatgpt_waitForReadyAndSend(
 async function chatgpt_pasteInput(
  text,
  autoSend,
- expectedConversationUrl
+ expectedConversationUrl,
+ transferOptions
 ) {
  if (chatgpt_pasteInput.__busy) {
  return {
@@ -2021,6 +2087,9 @@ async function chatgpt_pasteInput(
  chatgpt_pasteInput.__busy = true;
 
  try {
+ const options = transferOptions || {};
+ const autoReturnInput =
+ options.autoReturn === true;
  const input =
  chatgpt_getInputEl();
 
@@ -2106,8 +2175,12 @@ async function chatgpt_pasteInput(
  }
  }
 
- const pasted =
- chatgpt_pasteOnce(
+ const pasted = autoReturnInput
+ ? chatgpt_pasteAutoReturnOnce(
+ input,
+ expectedText
+ )
+ : chatgpt_pasteOnce(
  input,
  expectedText
  );
@@ -2135,9 +2208,10 @@ async function chatgpt_pasteInput(
  return await
  chatgpt_waitForReadyAndSend(
  expectedText,
- 20000,
+ autoReturnInput ? 45000 : 20000,
  changeTracker,
- expectedConversationUrl
+ expectedConversationUrl,
+ autoReturnInput
  );
  } finally {
  chatgpt_pasteInput.__busy =
@@ -2656,12 +2730,162 @@ const ctbReportProbe = {
   active: false,
   chatKey: '',
   jobId: '',
+  beginSequence: '',
+  beginSeen: false,
   readySequence: '',
+  readySeen: false,
   routeToken: '',
   status: 'idle',
   seen: new Map(),
-  candidates: []
+  candidates: [],
+  nextCandidateSequence: 1
 };
+
+const CTB_REPORT_PROBE_MAX_CANDIDATES = 200;
+const CTB_REPORT_PROBE_MAX_TEXT_LENGTH = 250000;
+const CTB_REPORT_BEGIN_RE =
+  /^CTB_REPORT_BEGIN (J\d{4,}-\d{6}-\d{2}) (R[1-9]\d*)$/;
+const CTB_REPORT_READY_RE =
+  /^CTB_REPORT_READY (J\d{4,}-\d{6}-\d{2}) (R[1-9]\d*)$/;
+
+function ctbReportProbeParseMessage(text) {
+  const source = normalizeBridgeText(text);
+  const lines = source.split('\n');
+  const beginSignals = [];
+  const readySignals = [];
+  const bodyLines = [];
+
+  lines.forEach(function(line) {
+    const trimmed = line.trim();
+    const begin = trimmed.match(CTB_REPORT_BEGIN_RE);
+    const ready = trimmed.match(CTB_REPORT_READY_RE);
+
+    if (begin) {
+      beginSignals.push({
+        jobId: begin[1],
+        sequence: begin[2]
+      });
+      return;
+    }
+
+    if (ready) {
+      readySignals.push({
+        jobId: ready[1],
+        sequence: ready[2]
+      });
+      return;
+    }
+
+    bodyLines.push(line);
+  });
+
+  while (bodyLines.length && !bodyLines[0].trim()) {
+    bodyLines.shift();
+  }
+
+  while (
+    bodyLines.length &&
+    !bodyLines[bodyLines.length - 1].trim()
+  ) {
+    bodyLines.pop();
+  }
+
+  return {
+    beginSignals: beginSignals,
+    readySignals: readySignals,
+    body: bodyLines.join('\n')
+  };
+}
+
+function ctbReportProbeAddCandidate(descriptor, text) {
+  if (!text || !text.trim()) return true;
+
+  const existing = ctbReportProbe.candidates.find(
+    function(item) {
+      return item.key === descriptor.key;
+    }
+  );
+
+  if (existing) {
+    existing.text = text;
+    existing.order = descriptor.order;
+    return true;
+  }
+
+  ctbReportProbe.candidates.push({
+    key: descriptor.key,
+    order: descriptor.order,
+    sequence: ctbReportProbe.nextCandidateSequence++,
+    text: text
+  });
+
+  return (
+    ctbReportProbe.candidates.length <=
+    CTB_REPORT_PROBE_MAX_CANDIDATES
+  );
+}
+
+function ctbReportProbeBuildResult() {
+  const candidates = ctbReportProbe.candidates.slice();
+
+  if (!candidates.length) {
+    return {
+      ok: false,
+      error: '완료보고 본문 없음'
+    };
+  }
+
+  const allHaveOrder = candidates.every(function(item) {
+    return Number.isFinite(Number(item.order));
+  });
+
+  if (allHaveOrder) {
+    const usedOrders = new Set();
+
+    for (const item of candidates) {
+      const order = Number(item.order);
+
+      if (usedOrders.has(order)) {
+        return {
+          ok: false,
+          error: '완료보고 순서 충돌'
+        };
+      }
+
+      usedOrders.add(order);
+    }
+
+    candidates.sort(function(a, b) {
+      return Number(a.order) - Number(b.order);
+    });
+  } else {
+    candidates.sort(function(a, b) {
+      return a.sequence - b.sequence;
+    });
+  }
+
+  const text = candidates
+    .map(function(item) {
+      return item.text;
+    })
+    .join('\n\n');
+
+  if (
+    !text.trim() ||
+    text.length > CTB_REPORT_PROBE_MAX_TEXT_LENGTH
+  ) {
+    return {
+      ok: false,
+      error: '완료보고 길이 확인 필요'
+    };
+  }
+
+  return {
+    ok: true,
+    text: text,
+    candidateCount: candidates.length
+  };
+}
 
 function ctbReportProbeShow(message, type) {
   const panel = document.getElementById('ctb-tg-panel');
@@ -2694,9 +2918,59 @@ function ctbReportProbeStop(status, message, type) {
   console.info('[CTB REPORT PROBE]', {
     status: status,
     jobId: ctbReportProbe.jobId,
+    beginSeen: ctbReportProbe.beginSeen,
+    beginSequence: ctbReportProbe.beginSequence,
     readySequence: ctbReportProbe.readySequence,
     candidateCount: ctbReportProbe.candidates.length
   });
+}
+
+function ctbSyncCancelledAutoReturnRoute(routes) {
+  if (
+    SITE !== 'telegram' ||
+    !ctbReportProbe.routeToken ||
+    !Array.isArray(routes)
+  ) {
+    return;
+  }
+
+  const route = routes.find(function(item) {
+    return (
+      item?.routingVersion === '061-8' &&
+      item?.autoReturn === true &&
+      item?.token === ctbReportProbe.routeToken
+    );
+  });
+
+  if (
+    !route ||
+    route.status !== 'cancelled'
+  ) {
+    return;
+  }
+
+  if (
+    !ctbReportProbe.active &&
+    ctbReportProbe.status !== 'ready_detected'
+  ) {
+    return;
+  }
+
+  ctbReportProbeStop(
+    'cancelled',
+    '⛔ GPT 자동전달 취소됨',
+    'err'
+  );
+
+  ctbReportProbe.routeToken = '';
+  ctbReportProbe.jobId = '';
+  ctbReportProbe.beginSequence = '';
+  ctbReportProbe.beginSeen = false;
+  ctbReportProbe.readySequence = '';
+  ctbReportProbe.readySeen = false;
+  ctbReportProbe.candidates = [];
+  ctbReportProbe.nextCandidateSequence = 1;
+  ctbReportProbe.seen = new Map();
 }
 
 function ctbReportProbeArm(routeToken) {
@@ -2709,11 +2983,15 @@ function ctbReportProbeArm(routeToken) {
 
   ctbReportProbe.chatKey = telegram_getCurrentChatKey();
   ctbReportProbe.jobId = '';
+  ctbReportProbe.beginSequence = '';
+  ctbReportProbe.beginSeen = false;
   ctbReportProbe.readySequence = '';
+  ctbReportProbe.readySeen = false;
   ctbReportProbe.routeToken =
     typeof routeToken === 'string' ? routeToken : '';
   ctbReportProbe.status = 'waiting_job';
   ctbReportProbe.candidates = [];
+  ctbReportProbe.nextCandidateSequence = 1;
   ctbReportProbe.seen = new Map();
 
   telegramAnswerBatchCache.messages.forEach(function(message) {
@@ -2728,6 +3006,17 @@ function ctbReportProbeArm(routeToken) {
     status: 'waiting_job',
     chatKeyMatched: true
   });
+
+  if (ctbReportProbe.routeToken) {
+    chrome.storage.local.get(
+      ['bridge_auto_return_routes'],
+      function(result) {
+        ctbSyncCancelledAutoReturnRoute(
+          result?.bridge_auto_return_routes
+        );
+      }
+    );
+  }
 }
 
 function ctbReportProbeCancel() {
@@ -2774,7 +3063,8 @@ function ctbReportProbeObserve(descriptor) {
     descriptor.text
   );
 
-  const lines = normalizeBridgeText(descriptor.text)
+  const normalizedText = normalizeBridgeText(descriptor.text);
+  const lines = normalizedText
     .split('\n')
     .map(function(line) {
       return line.trim();
@@ -2803,12 +3093,23 @@ function ctbReportProbeObserve(descriptor) {
       ctbReportProbe.jobId = nextJobId;
 
       if (ctbReportProbe.routeToken) {
+        const requestedRouteToken =
+          ctbReportProbe.routeToken;
+
         chrome.runtime.sendMessage({
           action: 'ctbAutoReturnJob',
-          token: ctbReportProbe.routeToken,
+          token: requestedRouteToken,
           jobId: nextJobId
         }, function() {
           void chrome.runtime.lastError;
+
+          if (
+            ctbReportProbe.status === 'cancelled' ||
+            ctbReportProbe.routeToken !==
+              requestedRouteToken
+          ) {
+            return;
+          }
         });
       }
 
@@ -2822,100 +3123,171 @@ function ctbReportProbeObserve(descriptor) {
     return;
   }
 
-  const readyLine = lines.find(function(line) {
-    return /^CTB_REPORT_READY J\d{4,}-\d{6}-\d{2} R[1-9]\d*$/.test(line);
-  });
+  if (!ctbReportProbe.jobId) return;
 
-  if (readyLine) {
-    const matched = readyLine.match(
-      /^CTB_REPORT_READY (J\d{4,}-\d{6}-\d{2}) (R[1-9]\d*)$/
+  const parsed = ctbReportProbeParseMessage(normalizedText);
+
+  if (
+    parsed.beginSignals.length > 1 ||
+    parsed.readySignals.length > 1
+  ) {
+    ctbReportProbeStop(
+      'ambiguous',
+      '⚠️ 보고서 제어 신호 중복',
+      'err'
     );
+    return;
+  }
 
-    if (
-      !matched ||
-      !ctbReportProbe.jobId ||
-      matched[1] !== ctbReportProbe.jobId
-    ) {
+  const beginSignal = parsed.beginSignals[0] || null;
+  const readySignal = parsed.readySignals[0] || null;
+
+  if (beginSignal) {
+    if (beginSignal.jobId !== ctbReportProbe.jobId) {
       ctbReportProbeStop(
         'ambiguous',
-        '⚠️ 종료 신호 Job ID 불일치',
+        '⚠️ 보고 시작 Job ID 불일치',
         'err'
       );
       return;
     }
 
-    ctbReportProbe.readySequence = matched[2];
+    if (
+      ctbReportProbe.beginSeen &&
+      ctbReportProbe.beginSequence !== beginSignal.sequence
+    ) {
+      ctbReportProbeStop(
+        'ambiguous',
+        '⚠️ 보고 시작 R번호 불일치',
+        'err'
+      );
+      return;
+    }
 
-    ctbReportProbeStop(
-      'ready_detected',
-      '✅ ' + matched[1] + ' ' + matched[2] +
-        ' 감지 · 후보 ' +
-        ctbReportProbe.candidates.length + '개',
-      'ok'
-    );
-
-    if (ctbReportProbe.routeToken) {
-      const candidateCount =
-        ctbReportProbe.candidates.length;
-
-      const candidateText =
-        candidateCount === 1
-          ? ctbReportProbe.candidates[0].text
-          : '';
-
-      chrome.runtime.sendMessage(
-        {
-          action: 'ctbAutoReturnReady',
-          token: ctbReportProbe.routeToken,
-          jobId: ctbReportProbe.jobId,
-          sequence: ctbReportProbe.readySequence,
-          candidateCount: candidateCount,
-          text: candidateText
-        },
-        function(result) {
-          const runtimeError = chrome.runtime.lastError;
-
-          if (runtimeError || !result?.ok) {
-            ctbReportProbeShow(
-              '⚠️ GPT 자동전송 미확인 · 수동전달 가능',
-              'err'
-            );
-            return;
-          }
-
-          ctbReportProbeShow(
-            '✅ GPT 전송 버튼 클릭 완료',
-            'ok'
-          );
-        }
+    if (!ctbReportProbe.beginSeen) {
+      ctbReportProbe.beginSeen = true;
+      ctbReportProbe.beginSequence = beginSignal.sequence;
+      ctbReportProbe.candidates = [];
+      ctbReportProbe.nextCandidateSequence = 1;
+      ctbReportProbe.status = 'collecting_report';
+      ctbReportProbeShow(
+        '⏳ ' + ctbReportProbe.jobId + ' ' +
+          beginSignal.sequence + ' 완료보고 수집 중'
       );
     }
-
-    return;
   }
 
-  if (!ctbReportProbe.jobId) return;
-
-  const existing = ctbReportProbe.candidates.find(
-    function(item) {
-      return item.key === descriptor.key;
-    }
-  );
-
-  if (existing) {
-    existing.text = descriptor.text;
-  } else {
-    ctbReportProbe.candidates.push({
-      key: descriptor.key,
-      text: descriptor.text
-    });
-  }
-
-  if (ctbReportProbe.candidates.length > 200) {
+  if (
+    !ctbReportProbeAddCandidate(
+      descriptor,
+      parsed.body
+    )
+  ) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ 수집 상한 초과 · 확인 필요',
       'err'
+    );
+    return;
+  }
+
+  if (!readySignal) return;
+
+  if (readySignal.jobId !== ctbReportProbe.jobId) {
+    ctbReportProbeStop(
+      'ambiguous',
+      '⚠️ 종료 신호 Job ID 불일치',
+      'err'
+    );
+    return;
+  }
+
+  if (
+    ctbReportProbe.beginSeen &&
+    ctbReportProbe.beginSequence !== readySignal.sequence
+  ) {
+    ctbReportProbeStop(
+      'ambiguous',
+      '⚠️ BEGIN/READY R번호 불일치',
+      'err'
+    );
+    return;
+  }
+
+  ctbReportProbe.readySequence = readySignal.sequence;
+  ctbReportProbe.readySeen = true;
+
+  const result = ctbReportProbeBuildResult();
+
+  const legacyValid =
+    !ctbReportProbe.beginSeen &&
+    result.candidateCount === 1;
+
+  const boundedValid =
+    ctbReportProbe.beginSeen &&
+    result.candidateCount >= 1 &&
+    result.candidateCount <= CTB_REPORT_PROBE_MAX_CANDIDATES;
+
+  if (!result.ok || (!legacyValid && !boundedValid)) {
+    ctbReportProbeStop(
+      'ambiguous',
+      '⚠️ 완료보고 결합 실패 · 수동전달 필요',
+      'err'
+    );
+    return;
+  }
+
+  ctbReportProbeStop(
+    'ready_detected',
+    '✅ ' + readySignal.jobId + ' ' + readySignal.sequence +
+      ' 감지 · 후보 ' + result.candidateCount + '개',
+    'ok'
+  );
+
+  if (ctbReportProbe.routeToken) {
+    const requestedRouteToken =
+      ctbReportProbe.routeToken;
+
+    chrome.runtime.sendMessage(
+      {
+        action: 'ctbAutoReturnReady',
+        token: requestedRouteToken,
+        jobId: ctbReportProbe.jobId,
+        beginSeen: ctbReportProbe.beginSeen,
+        beginJobId:
+          ctbReportProbe.beginSeen
+            ? ctbReportProbe.jobId
+            : '',
+        beginSequence: ctbReportProbe.beginSequence,
+        readyJobId: readySignal.jobId,
+        sequence: ctbReportProbe.readySequence,
+        candidateCount: result.candidateCount,
+        text: result.text
+      },
+      function(deliveryResult) {
+        const runtimeError = chrome.runtime.lastError;
+
+        if (
+          ctbReportProbe.status === 'cancelled' ||
+          ctbReportProbe.routeToken !==
+            requestedRouteToken
+        ) {
+          return;
+        }
+
+        if (runtimeError || !deliveryResult?.ok) {
+          ctbReportProbeShow(
+            '⚠️ GPT 자동전송 미확인 · 수동전달 가능',
+            'err'
+          );
+          return;
+        }
+
+        ctbReportProbeShow(
+          '✅ GPT 전송 버튼 클릭 완료',
+          'ok'
+        );
+      }
     );
   }
 }
@@ -6122,6 +6494,62 @@ const PANEL_STYLES = `
       color:#555; transition:color 0.15s,border-color 0.15s;
     }
     .ctb-switch-btn:hover { color:#a78bfa; border-color:#a78bfa; }
+    #ctb-ai-status-row {
+      display: flex !important;
+      align-items: flex-start !important;
+      gap: 4px !important;
+      width: 100% !important;
+      min-width: 0 !important;
+      margin-top: 6px !important;
+    }
+
+    #ctb-ai-status-row #ctb-status {
+      flex: 1 1 0 !important;
+      width: auto !important;
+      min-width: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      text-align: left !important;
+      font-size: 9px !important;
+      line-height: 1.35 !important;
+      white-space: normal !important;
+      overflow-wrap: anywhere !important;
+      text-overflow: clip !important;
+      overflow: visible !important;
+    }
+
+    #ctb-ai-status-row #ctb-ai-auto-return-cancel {
+      flex: 0 0 auto !important;
+      width: auto !important;
+      min-width: 30px !important;
+      max-width: none !important;
+      min-height: 23px !important;
+      margin: 0 !important;
+      padding: 3px 5px !important;
+      border: 1px solid #55576a !important;
+      border-radius: 5px !important;
+      background: #292b3b !important;
+      color: #bfc1d1 !important;
+      font-size: 9px !important;
+      font-weight: 500 !important;
+      line-height: 15px !important;
+      white-space: nowrap !important;
+      overflow: visible !important;
+      text-overflow: clip !important;
+      cursor: pointer !important;
+      box-sizing: border-box !important;
+    }
+
+    #ctb-ai-status-row #ctb-ai-auto-return-cancel:hover {
+      background: #383b50 !important;
+      border-color: #777b96 !important;
+      color: #ffffff !important;
+    }
+
+    #ctb-ai-status-row #ctb-ai-auto-return-cancel:disabled {
+      opacity: 0.45 !important;
+      cursor: default !important;
+    }
 `;
 
 function clampPanelPosition(panel, left, top) {
@@ -6192,6 +6620,90 @@ function applyPreferredPanelPosition(panel) {
     clamped.top + 'px';
 }
 
+function ctbPanelPositionSessionKey(
+  storageKey
+) {
+  return 'ctb_tab_position_' + storageKey;
+}
+
+function ctbStorePanelPosition(
+  storageKey,
+  position
+) {
+  if (!storageKey || !position) {
+    return false;
+  }
+
+  if (SITE === 'chatgpt') {
+    try {
+      sessionStorage.setItem(
+        ctbPanelPositionSessionKey(
+          storageKey
+        ),
+        JSON.stringify(position)
+      );
+
+      return true;
+    } catch (error) {
+      console.warn(
+        '[CTB] 탭 위치 저장 실패',
+        error?.message || ''
+      );
+
+      return false;
+    }
+  }
+
+  chrome.storage.local.set({
+    [storageKey]: position
+  });
+
+  return true;
+}
+
+function ctbReadPanelPosition(
+  storageKey,
+  sharedPosition
+) {
+  if (SITE !== 'chatgpt') {
+    return sharedPosition || null;
+  }
+
+  try {
+    const raw = sessionStorage.getItem(
+      ctbPanelPositionSessionKey(
+        storageKey
+      )
+    );
+
+    if (!raw) {
+      return null;
+    }
+
+    const position =
+      JSON.parse(raw);
+
+    if (
+      !position ||
+      !Number.isFinite(
+        Number(position.left)
+      ) ||
+      !Number.isFinite(
+        Number(position.top)
+      )
+    ) {
+      return null;
+    }
+
+    return {
+      left: Number(position.left),
+      top: Number(position.top)
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
 function savePanelPosition(
   panel,
   storageKey
@@ -6243,10 +6755,10 @@ function savePanelPosition(
   panel.style.top =
     preferred.top + 'px';
 
-  chrome.storage.local.set({
-    [storageKey]:
-      preferred
-  });
+  ctbStorePanelPosition(
+    storageKey,
+    preferred
+  );
 }
 
 function applyStoredPanelPosition(
@@ -6341,6 +6853,43 @@ function syncPanelDisplay(panel) {
   });
 }
 
+function isSessionPanelUiState(storageKey) {
+  return (
+    SITE === 'chatgpt' &&
+    (
+      storageKey === 'widgetUiState_ai' ||
+      storageKey === 'widgetUiState_tg'
+    )
+  );
+}
+
+function readPanelUiState(storageKey, storedState) {
+  if (!isSessionPanelUiState(storageKey)) {
+    return normalizePanelUiState(storedState);
+  }
+
+  try {
+    return normalizePanelUiState(
+      sessionStorage.getItem(storageKey)
+    );
+  } catch (error) {
+    return 'normal';
+  }
+}
+
+function persistPanelUiState(storageKey, state) {
+  if (isSessionPanelUiState(storageKey)) {
+    try {
+      sessionStorage.setItem(storageKey, state);
+    } catch (error) {}
+    return;
+  }
+
+  chrome.storage.local.set({
+    [storageKey]: state
+  });
+}
+
 function setPanelUiState(
   panel,
   storageKey,
@@ -6376,10 +6925,10 @@ function setPanelUiState(
     persist &&
     storageKey
   ) {
-    chrome.storage.local.set({
-      [storageKey]:
-        nextState
-    });
+    persistPanelUiState(
+      storageKey,
+      nextState
+    );
   }
 }
 
@@ -6520,10 +7069,10 @@ function copyPanelPosition(
     preferred.top + 'px';
 
   if (storageKey) {
-    chrome.storage.local.set({
-      [storageKey]:
-        preferred
-    });
+    ctbStorePanelPosition(
+      storageKey,
+      preferred
+    );
   }
 
   requestAnimationFrame(function() {
@@ -6552,9 +7101,16 @@ function registerBridgeRefreshHandler(key, handler) {
 }
 
 function runBridgeRefreshHandler(key, done) {
-  var handler = getBridgeRefreshHandlers()[key];
-  if (typeof handler === 'function') { handler(done); return; }
-  if (typeof done === 'function') done();
+  const handler = getBridgeRefreshHandlers()[key];
+
+  if (typeof handler === 'function') {
+    handler(done);
+    return;
+  }
+
+  if (typeof done === 'function') {
+    done(false);
+  }
 }
 
 function isBridgeAIPage() {
@@ -6618,13 +7174,13 @@ function getAutoReturnRouteStatusView(status) {
   const views = {
     sending: ['⏳ Telegram 전송 중', ''],
     awaiting_job: ['⏳ GPT 회신 예약 · Job 연결 대기', ''],
-    awaiting_result: ['⏳ GPT 회신 예약 · 완료 대기', ''],
+    awaiting_result: ['⏳ Codex 완료보고 대기 중', ''],
     collecting_result: ['⏳ 완료보고 수집 중...', ''],
     delivering: ['⏳ GPT 자동전송 중', ''],
     delivered: ['✅ GPT 전송 버튼 클릭 완료', 'ok'],
     ambiguous: ['⚠️ 자동전송 확인 필요', 'err'],
     delivery_failed: ['❌ GPT 자동전달 실패', 'err'],
-    cancelled: ['⚠️ GPT 회신 예약 취소', 'err']
+    cancelled: ['✅ 자동전달 취소됨', 'ok']
   };
   return views[status] || null;
 }
@@ -6674,6 +7230,7 @@ function injectAIWidget() {
         <input type="checkbox" id="ctb-ai-auto-return" style="width:13px;height:13px;opacity:1;display:inline;flex-shrink:0;position:static;appearance:auto;accent-color:#2AABEE" />
         <span>완료보고 → GPT 자동전달</span>
       </label>
+      <button id="ctb-ai-auto-return-cancel" class="ctb-btn" style="display:none">취소</button>
       <button id="ctb-ai-switch" class="ctb-switch-btn">🔁 위젯 전환</button>
       <div id="ctb-status"></div>
     </div>
@@ -6681,6 +7238,72 @@ function injectAIWidget() {
   `;
 
   document.body.appendChild(panel);
+
+  {
+    const cancelLayoutStatus =
+      panel.querySelector('#ctb-status');
+
+    const cancelLayoutButton =
+      panel.querySelector(
+        '#ctb-ai-auto-return-cancel'
+      );
+
+    if (
+      !cancelLayoutStatus ||
+      !cancelLayoutButton
+    ) {
+      throw new Error(
+        '061-13c: 자동회신 상태 또는 취소 버튼을 찾지 못함'
+      );
+    }
+
+    const cancelStatusRow =
+      document.createElement('div');
+
+    cancelStatusRow.id = 'ctb-ai-status-row';
+
+    cancelLayoutStatus.parentNode.insertBefore(
+      cancelStatusRow,
+      cancelLayoutStatus
+    );
+
+    cancelStatusRow.appendChild(
+      cancelLayoutStatus
+    );
+
+    cancelStatusRow.appendChild(
+      cancelLayoutButton
+    );
+
+    cancelLayoutButton.classList.remove(
+      'ctb-btn'
+    );
+
+    cancelLayoutButton.textContent = '취소';
+
+    cancelLayoutButton.title =
+      'GPT 자동회신 취소';
+
+    cancelLayoutButton.style.removeProperty(
+      'background'
+    );
+
+    cancelLayoutButton.style.removeProperty(
+      'width'
+    );
+
+    cancelLayoutButton.style.removeProperty(
+      'padding'
+    );
+
+    cancelLayoutButton.style.removeProperty(
+      'color'
+    );
+
+    cancelLayoutButton.style.removeProperty(
+      'border'
+    );
+  }
 
   panel.dataset.ctbUiState =
     'normal';
@@ -6848,13 +7471,108 @@ function injectAIWidget() {
       }
     );
 
-  panel.querySelector('#ctb-ai-refresh').addEventListener('click', (e) => {
-    e.stopPropagation();
-    runBridgeRefreshHandler('aiSource', function() {
-      syncBridgeTargetPickerVisibility();
-      setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok');
+  let aiPanelRefreshBusy = false;
+
+  panel.querySelector('#ctb-ai-refresh')
+    .addEventListener('click', function(e) {
+      e.stopPropagation();
+
+      if (aiPanelRefreshBusy) return;
+
+      aiPanelRefreshBusy = true;
+
+      const refreshButton = e.currentTarget;
+      refreshButton.disabled = true;
+
+      const finish = function(ok, message) {
+        aiPanelRefreshBusy = false;
+        refreshButton.disabled = false;
+
+        if (!ok) {
+          setStatus(
+            message || '❌ 패널 정보 새로고침 실패',
+            'err'
+          );
+        }
+      };
+
+      runBridgeRefreshHandler(
+        'aiSource',
+        function(sourceOk) {
+          if (sourceOk !== true) {
+            finish(false);
+            return;
+          }
+
+          try {
+            chrome.storage.local.get(
+              [
+                'bridge_mode',
+                'bridge_autosend_ai',
+                'bridge_auto_return_enabled'
+              ],
+              function(settings) {
+                const storageError =
+                  chrome.runtime.lastError;
+
+                if (storageError) {
+                  finish(false);
+                  return;
+                }
+
+                try {
+                  applyCopyMode(
+                    settings?.bridge_mode === 'full'
+                      ? 'full'
+                      : 'code'
+                  );
+
+                  autoCheck.checked =
+                    settings?.bridge_autosend_ai !== false;
+
+                  autoReturnCheck.checked =
+                    settings?.bridge_auto_return_enabled === true;
+
+                  refreshDeepSeekBalanceBox();
+                  applyDeepSeekPeakStyle();
+                  checkStreaming();
+
+                  syncBridgeTargetPickerVisibility();
+
+                  if (
+                    typeof panel.__ctbApplyVisualState ===
+                      'function'
+                  ) {
+                    panel.__ctbApplyVisualState(
+                      normalizePanelUiState(
+                        panel.dataset.ctbUiState
+                      )
+                    );
+                  }
+
+                  syncPanelDisplay(panel);
+
+                  setStatus(
+                    '↺ 패널 정보 새로고침 완료',
+                    'ok'
+                  );
+
+                  // 현재 자동회신 상태를 저장소에서 재조회한다.
+                  // 진행 중인 예약은 수정하지 않는다.
+                  refreshAutoReturnRouteStatus();
+
+                  finish(true);
+                } catch (error) {
+                  finish(false);
+                }
+              }
+            );
+          } catch (error) {
+            finish(false);
+          }
+        }
+      );
     });
-  });
 
   panel.addEventListener(
     'click',
@@ -6925,6 +7643,9 @@ function injectAIWidget() {
   const autoCheck = panel.querySelector('#ctb-ai-autosend');
   const autoReturnCheck = panel.querySelector('#ctb-ai-auto-return');
   const autoReturnLabel = panel.querySelector('#ctb-ai-auto-return-label');
+  const autoReturnCancelButton = panel.querySelector(
+    '#ctb-ai-auto-return-cancel'
+  );
 
   if (autoReturnLabel && SITE !== 'chatgpt') {
     autoReturnLabel.style.setProperty(
@@ -7405,11 +8126,24 @@ function injectAIWidget() {
   const refreshAiSourceTabs = function(done) {
     try {
       chrome.runtime.sendMessage({ action: 'getAiTabs' }, function(res) {
-        if (!res || !res.tabs || !res.tabs.length) {
+        const runtimeError = chrome.runtime.lastError;
+
+        if (
+          runtimeError ||
+          !res ||
+          !Array.isArray(res.tabs)
+        ) {
+          if (typeof done === 'function') {
+            done(false);
+          }
+          return;
+        }
+
+        if (!res.tabs.length) {
           aiSourceSelect.innerHTML = '<option value="">AI 탭 없음</option>';
           applyAISource(null);
           updateAISourcePanelUI();
-          if (typeof done === 'function') done();
+          if (typeof done === 'function') done(true);
           return;
         }
         var tabs = res.tabs;
@@ -7443,13 +8177,13 @@ function injectAIWidget() {
           applyAISource({ site: selectedOption.dataset.site, siteName: selectedOption.dataset.siteName, title: selectedTab.title || selectedOption.textContent, id: selectedTab.id, url: selectedTab.url || '' });
         }
         updateAISourcePanelUI();
-        if (typeof done === 'function') done();
+        if (typeof done === 'function') done(true);
       });
     } catch(e) {
       aiSourceSelect.innerHTML = '<option value="">AI 탭 오류</option>';
       applyAISource(null);
       updateAISourcePanelUI();
-      if (typeof done === 'function') done();
+      if (typeof done === 'function') done(false);
     }
   };
 
@@ -7497,16 +8231,65 @@ function injectAIWidget() {
   });
   const setStatus = (msg, type) => setPanelStatus(statusEl, msg, type);
   const setBtnsDisabled = (v) => setPanelBtnsDisabled([btn1], v);
+  let currentAutoReturnRoute = null;
+  let autoReturnCancelStateRequest = 0;
+
+  function refreshAutoReturnCancelState() {
+    const requestId =
+      ++autoReturnCancelStateRequest;
+
+    currentAutoReturnRoute = null;
+
+    if (autoReturnCancelButton) {
+      autoReturnCancelButton.style.display = 'none';
+    }
+
+    if (
+      SITE !== 'chatgpt' ||
+      !autoReturnCancelButton
+    ) {
+      return;
+    }
+
+    chrome.runtime.sendMessage(
+      {
+        action: 'ctbGetAutoReturnCancelState'
+      },
+      function(result) {
+        const runtimeError =
+          chrome.runtime.lastError;
+
+        if (
+          requestId !== autoReturnCancelStateRequest ||
+          runtimeError ||
+          result?.ok !== true ||
+          result?.canCancel !== true ||
+          !result.routeId
+        ) {
+          return;
+        }
+
+        currentAutoReturnRoute = {
+          routeId: result.routeId,
+          status: result.status,
+          updatedAt:
+            Number(result.updatedAt || 0)
+        };
+
+        autoReturnCancelButton.style.display = 'block';
+      }
+    );
+  }
 
   function applyAutoReturnRouteStatus(routes) {
-    if (SITE !== 'chatgpt' || !Array.isArray(routes)) return;
+    if (SITE !== 'chatgpt' || !Array.isArray(routes)) {
+      refreshAutoReturnCancelState();
+      return;
+    }
 
-    const currentUrl =
-      normalizeAutoReturnConversationUrl(location.href);
     const route = routes
       .filter(function(item) {
         return (
-          item?.sourceConversationUrl === currentUrl &&
           item.routingVersion === '061-8' &&
           item.autoReturn === true
         );
@@ -7514,6 +8297,8 @@ function injectAIWidget() {
       .sort(function(a, b) {
         return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
       })[0];
+
+    refreshAutoReturnCancelState();
 
     if (!route) return;
     const view = getAutoReturnRouteStatusView(route.status);
@@ -7535,6 +8320,54 @@ function injectAIWidget() {
     }
   }
 
+  if (autoReturnCancelButton) {
+    autoReturnCancelButton.addEventListener(
+      'click',
+      function() {
+        const route = currentAutoReturnRoute;
+
+        if (
+          !route ||
+          !['sending', 'awaiting_job', 'awaiting_result'].includes(route.status)
+        ) {
+          setStatus('⚠️ 취소할 자동회신 예약이 없습니다.', 'err');
+          return;
+        }
+
+        autoReturnCancelButton.disabled = true;
+
+        chrome.runtime.sendMessage(
+          {
+            action: 'ctbAutoReturnCancel',
+            routeId: route.routeId
+          },
+          function(result) {
+            autoReturnCancelButton.disabled = false;
+            const runtimeError = chrome.runtime.lastError;
+
+            if (runtimeError || !result?.ok) {
+              const latestStatus =
+                result?.status || route.status;
+
+              setStatus(
+                latestStatus === 'delivering'
+                  ? 'GPT 전송이 시작되어 취소할 수 없음'
+                  : '❌ ' + (result?.error || '자동회신 취소 실패'),
+                'err'
+              );
+            } else {
+              currentAutoReturnRoute = null;
+              autoReturnCancelButton.style.display = 'none';
+              setStatus('✅ GPT 자동회신 취소 완료', 'ok');
+            }
+
+            refreshAutoReturnRouteStatus();
+          }
+        );
+      }
+    );
+  }
+
   function refreshAutoReturnRouteStatus() {
     chrome.storage.local.get(
       ['bridge_auto_return_routes'],
@@ -7552,12 +8385,18 @@ function injectAIWidget() {
         areaName === 'local' &&
         changes?.bridge_auto_return_routes
       ) {
+        ctbSyncCancelledAutoReturnRoute(
+          changes.bridge_auto_return_routes.newValue
+        );
+
         applyAutoReturnRouteStatus(
           changes.bridge_auto_return_routes.newValue
         );
       }
     }
   );
+
+  refreshAutoReturnRouteStatus();
 
   let telegramSendQueued = false;
   let telegramSendQueueSending = false;
@@ -7717,7 +8556,9 @@ function injectAIWidget() {
           autoReturn === true,
         sourceAiTabId: sourceAi.id,
         sourceAiUrl: sourceAi.url,
-        sourceAiTitle: sourceAi.title
+        sourceAiTitle: sourceAi.title,
+        copyTrigger:
+          queued ? 'queued' : 'manual'
       },
       function(res) {
         setBtnsDisabled(false);
@@ -7757,6 +8598,8 @@ function injectAIWidget() {
               : '✅ Telegram 전송!',
             'ok'
           );
+
+          refreshAutoReturnRouteStatus();
 
           return;
         }
@@ -8365,13 +9208,109 @@ function injectTGWidget() {
       }
     );
 
-  panel.querySelector('#ctb-tg-refresh').addEventListener('click', (e) => {
-    e.stopPropagation();
-    runBridgeRefreshHandler('tgTarget', function() {
-      syncBridgeTargetPickerVisibility();
-      setStatus('\u21BA \uC0C8\uB85C\uACE0\uCE68 \uC644\uB8CC', 'ok');
+  let tgPanelRefreshBusy = false;
+
+  panel.querySelector('#ctb-tg-refresh')
+    .addEventListener('click', function(e) {
+      e.stopPropagation();
+
+      if (tgPanelRefreshBusy) return;
+
+      tgPanelRefreshBusy = true;
+
+      const refreshButton = e.currentTarget;
+      refreshButton.disabled = true;
+
+      const finish = function(ok, message) {
+        tgPanelRefreshBusy = false;
+        refreshButton.disabled = false;
+
+        if (!ok) {
+          setStatus(
+            message || '❌ 패널 정보 새로고침 실패',
+            'err'
+          );
+        }
+      };
+
+      runBridgeRefreshHandler(
+        'tgTarget',
+        function(targetOk) {
+          if (targetOk !== true) {
+            finish(false);
+            return;
+          }
+
+          try {
+            chrome.storage.local.get(
+              [
+                'bridge_tgmode',
+                'bridge_autosend_tg'
+              ],
+              function(settings) {
+                const storageError =
+                  chrome.runtime.lastError;
+
+                if (storageError) {
+                  finish(false);
+                  return;
+                }
+
+                try {
+                  applyTGMode(
+                    settings?.bridge_tgmode === 'last'
+                      ? 'last'
+                      : 'all'
+                  );
+
+                  autoCheck.checked =
+                    settings?.bridge_autosend_tg !== false;
+
+                  syncBridgeTargetPickerVisibility();
+
+                  // 기존 Observer를 재사용한다.
+                  telegram_ensureAnswerBatchObserver();
+                  telegram_captureAnswerBatch();
+
+                  if (
+                    typeof panel.__ctbApplyVisualState ===
+                      'function'
+                  ) {
+                    panel.__ctbApplyVisualState(
+                      normalizePanelUiState(
+                        panel.dataset.ctbUiState
+                      )
+                    );
+                  }
+
+                  syncPanelDisplay(panel);
+
+                  if (ctbReportProbe.status !== 'idle') {
+                    // 작업 감지 상태와 기존 후보 복사 상태를
+                    // 현재 표시 그대로 유지하며 다시 반영한다.
+                    ctbReportProbeShow(
+                      statusEl?.textContent || '',
+                      statusEl?.className || ''
+                    );
+                  } else {
+                    setStatus(
+                      '↺ 패널 정보 새로고침 완료',
+                      'ok'
+                    );
+                  }
+
+                  finish(true);
+                } catch (error) {
+                  finish(false);
+                }
+              }
+            );
+          } catch (error) {
+            finish(false);
+          }
+        }
+      );
     });
-  });
 
   panel.addEventListener(
     'click',
@@ -8437,13 +9376,29 @@ function injectTGWidget() {
     }
   };
 
-  var refreshAiTabs = function() {
+  var refreshAiTabs = function(done) {
     try {
       chrome.runtime.sendMessage({ action: 'getAiTabs' }, function(res) {
-        if (!res || !res.tabs || !res.tabs.length) {
+        const runtimeError = chrome.runtime.lastError;
+
+        if (
+          runtimeError ||
+          !res ||
+          !Array.isArray(res.tabs)
+        ) {
+          if (typeof done === 'function') {
+            done(false);
+          }
+          return;
+        }
+
+        if (!res.tabs.length) {
           aiSelect.innerHTML = '<option value="">AI 탭 없음</option>';
           applyAI(null);
           updateTGTargetPanelUI();
+          if (typeof done === 'function') {
+            done(true);
+          }
           return;
         }
         var tabs = res.tabs;
@@ -8476,11 +9431,17 @@ function injectTGWidget() {
           applyAI({ site: selectedOption.dataset.site, siteName: selectedOption.dataset.siteName, title: selectedTab.title || selectedOption.textContent, id: selectedTab.id });
         }
         updateTGTargetPanelUI();
+        if (typeof done === 'function') {
+          done(true);
+        }
       });
     } catch(e) {
       aiSelect.innerHTML = '<option value="">AI 탭 오류</option>';
       applyAI(null);
       updateTGTargetPanelUI();
+      if (typeof done === 'function') {
+        done(false);
+      }
     }
   };
 
@@ -8702,6 +9663,137 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ streaming: isStreaming() });
     return true;
   }
+  if (
+    msg.action ===
+    'ctbRestorePanelsInThisTab'
+  ) {
+    const aiPanel =
+      document.getElementById(
+        'ctb-ai-panel'
+      );
+
+    const tgPanel =
+      document.getElementById(
+        'ctb-tg-panel'
+      );
+
+    if (!aiPanel || !tgPanel) {
+      sendResponse({
+        ok: false,
+        error:
+          '현재 탭에서 플로팅 패널을 찾지 못했습니다.'
+      });
+      return true;
+    }
+
+    chrome.storage.local.get(
+      ['widget_state'],
+      function(res) {
+        const storageError =
+          chrome.runtime.lastError;
+
+        if (storageError) {
+          sendResponse({
+            ok: false,
+            error:
+              '패널 표시 설정 조회 실패'
+          });
+          return;
+        }
+
+        try {
+          setPanelUiState(
+            aiPanel,
+            'widgetUiState_ai',
+            'normal',
+            true
+          );
+
+          setPanelUiState(
+            tgPanel,
+            'widgetUiState_tg',
+            'normal',
+            true
+          );
+
+          const widgetState =
+            res?.widget_state === 'swapped'
+              ? 'swapped'
+              : 'normal';
+
+          // 위치를 복사하지 않고 표시 상태만 복구한다.
+          applyState(
+            widgetState,
+            false
+          );
+
+          const visiblePanel =
+            aiPanel.dataset.ctbRouteVisible ===
+              'true'
+              ? aiPanel
+              : tgPanel;
+
+          requestAnimationFrame(
+            function() {
+              applyPreferredPanelPosition(
+                visiblePanel
+              );
+
+              const visible =
+                getComputedStyle(
+                  visiblePanel
+                ).display !== 'none';
+
+              sendResponse({
+                ok: visible,
+                error: visible
+                  ? ''
+                  : '패널 표시 복구 실패'
+              });
+            }
+          );
+        } catch (error) {
+          sendResponse({
+            ok: false,
+            error:
+              error?.message ||
+              '패널 복구 처리 실패'
+          });
+        }
+      }
+    );
+
+    return true;
+  }
+  if (msg.action === 'ctbAutoReturnWatch') {
+    if (
+      SITE !== 'telegram' ||
+      !ctbReportProbe.active ||
+      !ctbReportProbe.routeToken ||
+      msg.token !== ctbReportProbe.routeToken
+    ) {
+      sendResponse({
+        ok: false,
+        error: 'telegram_probe_not_armed',
+        documentHidden: document.hidden === true,
+        visibilityState: document.visibilityState || ''
+      });
+      return true;
+    }
+
+    telegram_ensureAnswerBatchObserver();
+    telegram_captureAnswerBatch();
+
+    sendResponse({
+      ok: true,
+      status: ctbReportProbe.status,
+      jobId: ctbReportProbe.jobId,
+      candidateCount: ctbReportProbe.candidates.length,
+      documentHidden: document.hidden === true,
+      visibilityState: document.visibilityState || ''
+    });
+    return true;
+  }
   if (msg.action === 'ctbAutoReturnDeliver') {
     (async function() {
       if (
@@ -8712,6 +9804,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       ) {
         return {
           ok: false,
+          phase: 'gpt_target_failed',
           error: '원본 ChatGPT 대화가 일치하지 않음'
         };
       }
@@ -8721,6 +9814,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (!input) {
         return {
           ok: false,
+          phase: 'gpt_input_failed',
           error: 'ChatGPT 입력창 없음'
         };
       }
@@ -8733,6 +9827,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (existingText) {
         return {
           ok: false,
+          phase: 'gpt_input_failed',
           error: '작성 중인 ChatGPT 입력 내용이 있어 자동전송 차단'
         };
       }
@@ -8740,6 +9835,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (chatgpt_isStreaming()) {
         return {
           ok: false,
+          phase: 'gpt_input_failed',
           error: 'ChatGPT가 현재 답변 중이어서 자동전송 차단'
         };
       }
@@ -8753,6 +9849,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       ) {
         return {
           ok: false,
+          phase: 'gpt_input_failed',
           error: '기존 ChatGPT 첨부파일 또는 업로드 작업이 있어 자동전송 차단'
         };
       }
@@ -8760,13 +9857,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const result = await chatgpt_pasteInput(
         msg.text,
         true,
-        msg.conversationUrl
+        msg.conversationUrl,
+        { autoReturn: true }
       );
 
       return {
         ok: result?.ok === true && result?.sent === true,
         sent: result?.sent === true,
-        error: result?.error || ''
+        phase:
+          result?.ok === true && result?.sent === true
+            ? 'gpt_send_success'
+            : (result?.phase || 'gpt_send_failed'),
+        error: result?.error || '',
+        documentHidden: document.hidden === true,
+        visibilityState: document.visibilityState || ''
       };
     })()
       .then(sendResponse)
@@ -8774,6 +9878,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({
           ok: false,
           sent: false,
+          phase: 'gpt_send_failed',
           error: error?.message || String(error)
         });
       });
@@ -8867,7 +9972,7 @@ chrome.storage.onChanged.addListener((changes) => {
         'ctb-ai-panel'
       );
 
-    if (aiPanel) {
+    if (aiPanel && SITE !== 'chatgpt') {
       setPanelUiState(
         aiPanel,
         'widgetUiState_ai',
@@ -8885,7 +9990,7 @@ chrome.storage.onChanged.addListener((changes) => {
         'ctb-tg-panel'
       );
 
-    if (tgPanel) {
+    if (tgPanel && SITE !== 'chatgpt') {
       setPanelUiState(
         tgPanel,
         'widgetUiState_tg',
@@ -8985,16 +10090,24 @@ if (SITE === 'telegram' || SITE) {
           setPanelUiState(
             aiPanel,
             'widgetUiState_ai',
-            res?.widgetUiState_ai ||
-              'normal',
+            readPanelUiState(
+              'widgetUiState_ai',
+              res?.widgetUiState_ai || 'normal'
+            ),
             false
           );
 
-          if (res?.widgetPos_ai) {
+          const aiPosition =
+            ctbReadPanelPosition(
+              'widgetPos_ai',
+              res?.widgetPos_ai
+            );
+
+          if (aiPosition) {
             applyStoredPanelPosition(
               aiPanel,
               'widgetPos_ai',
-              res.widgetPos_ai
+              aiPosition
             );
           }
         }
@@ -9003,16 +10116,24 @@ if (SITE === 'telegram' || SITE) {
           setPanelUiState(
             tgPanel,
             'widgetUiState_tg',
-            res?.widgetUiState_tg ||
-              'normal',
+            readPanelUiState(
+              'widgetUiState_tg',
+              res?.widgetUiState_tg || 'normal'
+            ),
             false
           );
 
-          if (res?.widgetPos_tg) {
+          const tgPosition =
+            ctbReadPanelPosition(
+              'widgetPos_tg',
+              res?.widgetPos_tg
+            );
+
+          if (tgPosition) {
             applyStoredPanelPosition(
               tgPanel,
               'widgetPos_tg',
-              res.widgetPos_tg
+              tgPosition
             );
           }
         }
