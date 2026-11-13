@@ -1478,6 +1478,29 @@ async function ctbCaptureChatgptCodeWithFallback(
 
 const CTB_RETURN_VERSION = '061-8';
 const CTB_RETURN_KEY = 'bridge_auto_return_routes';
+const CTB_CHAIN_APPROVAL_LINE_BG = '실행해';
+
+function ctbChainNormalizeRunText(value) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u200b/g, '')
+    .replace(/\n+$/g, '');
+}
+
+function ctbChainValidateRunText(value) {
+  const text = ctbChainNormalizeRunText(value);
+  const lines = text.split('\n');
+
+  return !!(
+    text.trim() &&
+    lines[0]?.trim() === '/run' &&
+    lines[lines.length - 1]?.trim() ===
+      CTB_CHAIN_APPROVAL_LINE_BG &&
+    lines.filter(function(line) {
+      return line.trim() === CTB_CHAIN_APPROVAL_LINE_BG;
+    }).length === 1
+  );
+}
 const CTB_AUTO_RETURN_WATCH_ALARM =
   'ctb-auto-return-watch-061';
 const CTB_AUTO_RETURN_WATCH_STATUSES = new Set([
@@ -1812,7 +1835,10 @@ async function ctbHandleReturnReady(message, sender) {
       {
         action: 'ctbAutoReturnDeliver',
         conversationUrl: route.sourceConversationUrl,
-        text: message.text
+        text: message.text,
+        chainEnabled: route.chainEnabled === true,
+        chainRouteId: route.routeId,
+        chainToken: route.token
       }
     );
 
@@ -1822,10 +1848,10 @@ async function ctbHandleReturnReady(message, sender) {
       route.token,
       ['delivering'],
       {
-        status: sent ? 'delivered' : 'delivery_failed',
+        status: sent ? 'awaiting_gpt' : 'delivery_failed',
         error: sent ? '' : (result?.error || 'ChatGPT 전송 미확인'),
         phase: sent
-          ? 'gpt_send_success'
+          ? 'waiting_gpt_response'
           : (result?.phase || 'gpt_send_failed'),
         gptDocumentHidden:
           result?.documentHidden === true,
@@ -1890,7 +1916,12 @@ async function ctbHandleReturnCancel(message, sender) {
 
   const updated = await ctbChangeReturnRoute(
     route.token,
-    ['sending', 'awaiting_job', 'awaiting_result'],
+    [
+      'sending',
+      'awaiting_job',
+      'awaiting_result',
+      'awaiting_gpt'
+    ],
     {
       status: 'cancelled',
       phase: 'cancelled_by_user',
@@ -1933,7 +1964,12 @@ async function ctbGetAutoReturnCancelState(sender) {
   );
   const canCancel = !!(
     routeMatches &&
-    ['sending', 'awaiting_job', 'awaiting_result'].includes(route.status)
+    [
+      'sending',
+      'awaiting_job',
+      'awaiting_result',
+      'awaiting_gpt'
+    ].includes(route.status)
   );
 
   return {
@@ -1947,6 +1983,128 @@ async function ctbGetAutoReturnCancelState(sender) {
   };
 }
 
+function ctbValidChainSender(sender, route) {
+  return !!(
+    sender?.tab &&
+    sender.tab.id === route?.sourceTabId &&
+    ctbReturnConversationUrl(sender.tab.url) ===
+      route?.sourceConversationUrl
+  );
+}
+
+async function ctbHandleAutoChainStop(message, sender) {
+  const route = await ctbReadReturnRoute();
+  const allowedReasons = new Set([
+    'gpt_response_not_instruction',
+    'gpt_response_timeout',
+    'gpt_conversation_changed',
+    'gpt_user_message_intervened'
+  ]);
+  const phase = allowedReasons.has(message.reason)
+    ? message.reason
+    : 'gpt_response_not_instruction';
+
+  if (
+    !route ||
+    route.routingVersion !== CTB_RETURN_VERSION ||
+    route.chainEnabled !== true ||
+    route.routeId !== message.routeId ||
+    route.token !== message.token ||
+    route.status !== 'awaiting_gpt' ||
+    !ctbValidChainSender(sender, route)
+  ) {
+    return { ok: false, error: '연속 작업 종료 검증 실패' };
+  }
+
+  const updated = await ctbChangeReturnRoute(
+    route.token,
+    ['awaiting_gpt'],
+    {
+      status: 'chain_stopped',
+      phase: phase,
+      error: '',
+      completedAt: Date.now()
+    }
+  );
+
+  return {
+    ok: !!updated,
+    status: updated?.status || route.status
+  };
+}
+
+async function ctbHandleAutoChainNext(message, sender) {
+  const route = await ctbReadReturnRoute();
+
+  if (
+    !route ||
+    route.routingVersion !== CTB_RETURN_VERSION ||
+    route.chainEnabled !== true ||
+    route.routeId !== message.routeId ||
+    route.token !== message.token ||
+    route.status !== 'awaiting_gpt' ||
+    !ctbValidChainSender(sender, route)
+  ) {
+    return { ok: false, error: '연속 작업 전송 검증 실패' };
+  }
+
+  const claimed = await ctbChangeReturnRoute(
+    route.token,
+    ['awaiting_gpt'],
+    {
+      status: 'chain_dispatching',
+      phase: 'chain_dispatching',
+      error: ''
+    }
+  );
+
+  if (!claimed) {
+    return { ok: false, error: '다음 작업 전송 선점 실패' };
+  }
+
+  let result;
+
+  try {
+    result = await handleAiToTelegram(
+      route.sourceTabId,
+      true,
+      {
+        sourceAiTabId: route.sourceTabId,
+        sourceAiUrl: route.sourceConversationUrl,
+        sourceAiTitle: ''
+      },
+      true,
+      'chain',
+      true,
+      {
+        routeId: route.routeId,
+        token: route.token,
+        chainCycle: route.chainCycle
+      }
+    );
+  } catch (error) {
+    result = {
+      ok: false,
+      error: error?.message || '다음 작업 전송 실패'
+    };
+  }
+
+  if (result?.ok !== true) {
+    await ctbChangeReturnRoute(
+      route.token,
+      ['chain_dispatching'],
+      {
+        status: 'awaiting_gpt',
+        phase: 'chain_dispatch_failed',
+        error: result?.error || '다음 작업 전송 실패',
+        updatedAt: Date.now()
+      }
+    );
+  }
+
+  return result;
+}
+
 ctbSyncReturnWatchAlarm().catch(function() {});
 
 // AI → Telegram
@@ -1955,7 +2113,9 @@ async function handleAiToTelegram(
   autoSend,
   sourceRequest,
   autoReturn,
-  copyTrigger
+  copyTrigger,
+  strictRun,
+  chainContext
 ) {
   const transferStartedAt = ctbTransferNow();
   const transferTiming = {
@@ -2034,7 +2194,8 @@ async function handleAiToTelegram(
     await sendToTab(
       sourceAiTab.id,
       {
-        action: 'getResponse'
+        action: 'getResponse',
+        strictRun: strictRun === true
       }
     );
 
@@ -2057,6 +2218,25 @@ async function handleAiToTelegram(
         'AI 원본 응답 출처를 확인할 수 없습니다.'
     };
   }
+
+  if (
+    strictRun === true &&
+    (
+      expectedSourceSite !== 'chatgpt' ||
+      aiRes?.strictRunValid !== true ||
+      !ctbChainValidateRunText(aiRes?.text)
+    )
+  ) {
+    return {
+      ok: false,
+      error: '다음 GPT 답변이 실행 지침 형식이 아닙니다.'
+    };
+  }
+
+  const strictExpectedText =
+    strictRun === true
+      ? ctbChainNormalizeRunText(aiRes.text)
+      : '';
 
   if (
     expectedSourceSite === 'chatgpt' &&
@@ -2082,6 +2262,17 @@ async function handleAiToTelegram(
           'ChatGPT 코드박스 복사에 실패했습니다.'
       };
     }
+  }
+
+  if (
+    strictRun === true &&
+    ctbChainNormalizeRunText(aiRes?.text) !==
+      strictExpectedText
+  ) {
+    return {
+      ok: false,
+      error: '실행 지침 원문 검증에 실패했습니다.'
+    };
   }
 
   if (!aiRes?.text) {
@@ -2133,12 +2324,22 @@ async function handleAiToTelegram(
       'sending',
       'awaiting_job',
       'awaiting_result',
-      'delivering'
+      'delivering',
+      'awaiting_gpt',
+      'chain_dispatching'
     ];
+
+    const replacingClaimedChain = !!(
+      chainContext &&
+      previous?.routeId === chainContext.routeId &&
+      previous?.token === chainContext.token &&
+      previous?.status === 'chain_dispatching'
+    );
 
     if (
       previous &&
       activeStatuses.includes(previous.status) &&
+      !replacingClaimedChain &&
       Date.now() - Number(previous.createdAt || 0) <
         12 * 60 * 60 * 1000
     ) {
@@ -2161,7 +2362,10 @@ async function handleAiToTelegram(
       status: 'sending',
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      error: ''
+      error: '',
+      chainEnabled: true,
+      chainCycle:
+        Number(chainContext?.chainCycle || 0) + 1
     };
 
     await ctbWriteReturnRoute(returnRoute);
@@ -2641,6 +2845,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.action === 'ctbAutoChainNext') {
+    ctbQueueReturnMutation(function() {
+      return ctbHandleAutoChainNext(msg, sender);
+    })
+      .then(sendResponse)
+      .catch(function(error) {
+        sendResponse({
+          ok: false,
+          error: error?.message || String(error)
+        });
+      });
+
+    return true;
+  }
+
+  if (msg.action === 'ctbAutoChainStop') {
+    ctbQueueReturnMutation(function() {
+      return ctbHandleAutoChainStop(msg, sender);
+    })
+      .then(sendResponse)
+      .catch(function(error) {
+        sendResponse({
+          ok: false,
+          error: error?.message || String(error)
+        });
+      });
+
+    return true;
+  }
+
   if (msg.action === 'ctbGetAutoReturnCancelState') {
     ctbGetAutoReturnCancelState(sender)
       .then(sendResponse)
@@ -2667,7 +2901,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sourceAiTitle: msg.sourceAiTitle
       },
       msg.autoReturn,
-      msg.copyTrigger
+      msg.copyTrigger,
+      false,
+      null
     )
       .then(sendResponse)
       .catch(function(e) {
