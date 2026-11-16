@@ -1520,6 +1520,60 @@ function ctbQueueReturnMutation(operation) {
   return pending;
 }
 
+async function ctbRunAutoReturnWhenJobSlotReady(
+  operation
+) {
+  const deadline = Date.now() + 20000;
+
+  while (true) {
+    const outcome = await ctbQueueReturnMutation(
+      async function() {
+        const routes = await ctbReadReturnRoutes();
+
+        const pendingJob = routes.some(
+          function(route) {
+            return (
+              ['sending', 'awaiting_job'].includes(
+                route.status
+              ) &&
+              Date.now() -
+                Number(route.createdAt || 0) <
+                12 * 60 * 60 * 1000
+            );
+          }
+        );
+
+        if (pendingJob) {
+          return {
+            deferred: true
+          };
+        }
+
+        return {
+          deferred: false,
+          result: await operation()
+        };
+      }
+    );
+
+    if (!outcome.deferred) {
+      return outcome.result;
+    }
+
+    if (Date.now() >= deadline) {
+      return {
+        ok: false,
+        error:
+          '이전 Telegram Job ID 등록을 확인하지 못했습니다. 잠시 후 다시 전송해주세요.'
+      };
+    }
+
+    await new Promise(function(resolve) {
+      setTimeout(resolve, 250);
+    });
+  }
+}
+
 function ctbReturnConversationUrl(value) {
   try {
     const url = new URL(value);
@@ -1543,25 +1597,72 @@ function ctbReturnConversationUrl(value) {
   }
 }
 
-async function ctbReadReturnRoute() {
+async function ctbReadReturnRoutes() {
   const data = await chrome.storage.local.get(CTB_RETURN_KEY);
-  const routes = data[CTB_RETURN_KEY];
 
-  if (!Array.isArray(routes)) return null;
+  const routes = Array.isArray(data[CTB_RETURN_KEY])
+    ? data[CTB_RETURN_KEY]
+    : [];
 
-  return routes.find(function(route) {
-    return route?.routingVersion === CTB_RETURN_VERSION;
-  }) || null;
+  return routes.filter(function(route) {
+    return (
+      route?.routingVersion === CTB_RETURN_VERSION &&
+      typeof route.token === 'string' &&
+      !!route.token
+    );
+  });
+}
+
+async function ctbReadReturnRoute(token) {
+  const routes = await ctbReadReturnRoutes();
+
+  if (token) {
+    return routes.find(function(route) {
+      return route.token === token;
+    }) || null;
+  }
+
+  return routes.sort(function(a, b) {
+    return Number(b.createdAt || 0) -
+      Number(a.createdAt || 0);
+  })[0] || null;
 }
 
 async function ctbWriteReturnRoute(route) {
+  if (
+    !route ||
+    route.routingVersion !== CTB_RETURN_VERSION ||
+    !route.token
+  ) {
+    throw new Error('자동회신 작업 저장 정보가 올바르지 않습니다.');
+  }
+
   const data = await chrome.storage.local.get(CTB_RETURN_KEY);
+
   const existing = Array.isArray(data[CTB_RETURN_KEY])
     ? data[CTB_RETURN_KEY]
     : [];
 
   const retained = existing.filter(function(item) {
-    return item?.routingVersion !== CTB_RETURN_VERSION;
+    if (item?.routingVersion !== CTB_RETURN_VERSION) {
+      return true;
+    }
+
+    if (item.token === route.token) {
+      return false;
+    }
+
+    // 동일 GPT 탭에서 다음 연속 작업으로 교체되는
+    // 이전 chain_dispatching 작업만 제외한다.
+    const supersededChain = (
+      route.status === 'sending' &&
+      item.sourceTabId === route.sourceTabId &&
+      item.status === 'chain_dispatching' &&
+      Number(item.chainCycle || 0) + 1 ===
+        Number(route.chainCycle || 0)
+    );
+
+    return !supersededChain;
   });
 
   await chrome.storage.local.set({
@@ -1571,14 +1672,16 @@ async function ctbWriteReturnRoute(route) {
   await ctbSyncReturnWatchAlarm(route);
 }
 
-async function ctbSyncReturnWatchAlarm(route) {
+async function ctbSyncReturnWatchAlarm() {
   if (!chrome.alarms) return;
 
-  const current = route || await ctbReadReturnRoute();
-  const active = !!(
-    current &&
-    CTB_AUTO_RETURN_WATCH_STATUSES.has(current.status)
-  );
+  const routes = await ctbReadReturnRoutes();
+
+  const active = routes.some(function(route) {
+    return CTB_AUTO_RETURN_WATCH_STATUSES.has(
+      route.status
+    );
+  });
 
   if (active) {
     chrome.alarms.create(
@@ -1594,97 +1697,105 @@ async function ctbSyncReturnWatchAlarm(route) {
 }
 
 async function ctbHandleReturnWatchAlarm() {
-  const route = await ctbReadReturnRoute();
+  const routes = (await ctbReadReturnRoutes())
+    .filter(function(route) {
+      return CTB_AUTO_RETURN_WATCH_STATUSES.has(
+        route.status
+      );
+    });
 
-  if (
-    !route ||
-    !CTB_AUTO_RETURN_WATCH_STATUSES.has(route.status)
-  ) {
-    await ctbSyncReturnWatchAlarm(route);
+  if (!routes.length) {
+    await ctbSyncReturnWatchAlarm();
     return;
   }
 
-  let tab;
+  for (const route of routes) {
+    let tab = null;
 
-  try {
-    tab = await chrome.tabs.get(route.telegramTabId);
-  } catch {
-    tab = null;
-  }
+    try {
+      tab = await chrome.tabs.get(
+        route.telegramTabId
+      );
+    } catch {}
 
-  if (
-    !tab ||
-    tab.discarded === true ||
-    !isTelegramDestinationUrl(tab.url)
-  ) {
-    await ctbChangeReturnRoute(
-      route.token,
-      [route.status],
-      {
-        phase: 'telegram_watch_failed',
-        diagnostic: 'telegram_tab_unavailable',
-        diagnosticAt: Date.now()
-      }
-    );
-    return;
-  }
+    if (
+      !tab ||
+      tab.discarded === true ||
+      !isTelegramDestinationUrl(tab.url)
+    ) {
+      await ctbChangeReturnRoute(
+        route.token,
+        [route.status],
+        {
+          phase: 'telegram_watch_failed',
+          diagnostic: 'telegram_tab_unavailable',
+          diagnosticAt: Date.now()
+        }
+      );
+      continue;
+    }
 
-  try {
-    const result = await chrome.tabs.sendMessage(
-      tab.id,
-      {
-        action: 'ctbAutoReturnWatch',
-        token: route.token
-      }
-    );
+    try {
+      const result = await chrome.tabs.sendMessage(
+        tab.id,
+        {
+          action: 'ctbAutoReturnWatch',
+          token: route.token
+        }
+      );
 
-    await ctbChangeReturnRoute(
-      route.token,
-      [route.status],
-      {
+      await ctbChangeReturnRoute(
+        route.token,
+        [route.status],
+        {
+          phase: result?.ok
+            ? 'telegram_watch_ok'
+            : 'telegram_watch_failed',
+          diagnostic: result?.ok
+            ? ''
+            : (
+              result?.error ||
+              'telegram_watch_unconfirmed'
+            ),
+          diagnosticAt: Date.now(),
+          telegramDocumentHidden:
+            result?.documentHidden === true,
+          telegramVisibilityState:
+            String(result?.visibilityState || '')
+        }
+      );
+
+      console.info('[CTB auto return watch]', {
         phase: result?.ok
           ? 'telegram_watch_ok'
           : 'telegram_watch_failed',
-        diagnostic: result?.ok
-          ? ''
-          : (result?.error || 'telegram_watch_unconfirmed'),
-        diagnosticAt: Date.now(),
-        telegramDocumentHidden:
+        jobId: route.jobId || '',
+        candidateCount:
+          Number(result?.candidateCount || 0),
+        documentHidden:
           result?.documentHidden === true,
-        telegramVisibilityState:
-          String(result?.visibilityState || '')
-      }
-    );
-
-    console.info('[CTB auto return watch]', {
-      phase: result?.ok
-        ? 'telegram_watch_ok'
-        : 'telegram_watch_failed',
-      jobId: route.jobId || '',
-      candidateCount:
-        Number(result?.candidateCount || 0),
-      documentHidden:
-        result?.documentHidden === true,
-      visibilityState:
-        String(result?.visibilityState || ''),
-      status: route.status
-    });
-  } catch (error) {
-    await ctbChangeReturnRoute(
-      route.token,
-      [route.status],
-      {
-        phase: 'telegram_watch_failed',
-        diagnostic:
-          error?.message || 'telegram_watch_failed',
-        diagnosticAt: Date.now()
-      }
-    );
+        visibilityState:
+          String(result?.visibilityState || ''),
+        status: route.status
+      });
+    } catch (error) {
+      await ctbChangeReturnRoute(
+        route.token,
+        [route.status],
+        {
+          phase: 'telegram_watch_failed',
+          diagnostic:
+            error?.message ||
+            'telegram_watch_failed',
+          diagnosticAt: Date.now()
+        }
+      );
+    }
   }
 }
 
 async function ctbChangeReturnRoute(token, allowedStatuses, patch) {
-  const current = await ctbReadReturnRoute();
+  const current = await ctbReadReturnRoute(token);
 
   if (
     !current ||
@@ -1716,7 +1827,7 @@ function ctbValidTelegramSender(sender, route, token) {
 }
 
 async function ctbHandleReturnJob(message, sender) {
-  const route = await ctbReadReturnRoute();
+  const route = await ctbReadReturnRoute(message.token);
 
   if (
     !ctbValidTelegramSender(sender, route, message.token) ||
@@ -1753,7 +1864,7 @@ async function ctbHandleReturnReady(message, sender) {
     return { ok: false, error: '전달 처리 중' };
   }
 
-  const route = await ctbReadReturnRoute();
+  const route = await ctbReadReturnRoute(message.token);
 
   if (
     !ctbValidTelegramSender(sender, route, message.token) ||
@@ -1888,7 +1999,16 @@ async function ctbHandleReturnReady(message, sender) {
 }
 
 async function ctbHandleReturnCancel(message, sender) {
-  const route = await ctbReadReturnRoute();
+  const routes = await ctbReadReturnRoutes();
+
+  const route = routes.find(function(item) {
+    return (
+      item.routeId === message.routeId &&
+      item.sourceTabId === sender?.tab?.id &&
+      item.sourceConversationUrl ===
+        ctbReturnConversationUrl(sender?.tab?.url)
+    );
+  }) || null;
   let senderIsChatgpt = false;
 
   try {
@@ -1940,7 +2060,20 @@ async function ctbHandleReturnCancel(message, sender) {
 }
 
 async function ctbGetAutoReturnCancelState(sender) {
-  const route = await ctbReadReturnRoute();
+  const routes = await ctbReadReturnRoutes();
+
+  const route = routes
+    .filter(function(item) {
+      return (
+        item.sourceTabId === sender?.tab?.id &&
+        item.sourceConversationUrl ===
+          ctbReturnConversationUrl(sender?.tab?.url)
+      );
+    })
+    .sort(function(a, b) {
+      return Number(b.createdAt || 0) -
+        Number(a.createdAt || 0);
+    })[0] || null;
   let senderIsChatgpt = false;
 
   try {
@@ -1993,7 +2126,7 @@ function ctbValidChainSender(sender, route) {
 }
 
 async function ctbHandleAutoChainStop(message, sender) {
-  const route = await ctbReadReturnRoute();
+  const route = await ctbReadReturnRoute(message.token);
   const allowedReasons = new Set([
     'gpt_response_not_instruction',
     'gpt_response_timeout',
@@ -2034,7 +2167,7 @@ async function ctbHandleAutoChainStop(message, sender) {
 }
 
 async function ctbHandleAutoChainNext(message, sender) {
-  const route = await ctbReadReturnRoute();
+  const route = await ctbReadReturnRoute(message.token);
 
   if (
     !route ||
@@ -2318,7 +2451,8 @@ async function handleAiToTelegram(
       };
     }
 
-    const previous = await ctbReadReturnRoute();
+    const previousRoutes =
+      await ctbReadReturnRoutes();
 
     const activeStatuses = [
       'sending',
@@ -2329,23 +2463,43 @@ async function handleAiToTelegram(
       'chain_dispatching'
     ];
 
-    const replacingClaimedChain = !!(
-      chainContext &&
-      previous?.routeId === chainContext.routeId &&
-      previous?.token === chainContext.token &&
-      previous?.status === 'chain_dispatching'
+    const conflictingRoute = previousRoutes.find(
+      function(previous) {
+        const active =
+          activeStatuses.includes(previous.status);
+
+        const replacingClaimedChain = !!(
+          chainContext &&
+          previous.routeId === chainContext.routeId &&
+          previous.token === chainContext.token &&
+          previous.status === 'chain_dispatching'
+        );
+
+        const withinLimit =
+          Date.now() -
+          Number(previous.createdAt || 0) <
+          12 * 60 * 60 * 1000;
+
+        const sameSourceTab =
+          previous.sourceTabId === sourceAiTab.id;
+
+        const sameConversation =
+          previous.sourceConversationUrl === conversationUrl;
+
+        return (
+          active &&
+          !replacingClaimedChain &&
+          withinLimit &&
+          (sameSourceTab || sameConversation)
+        );
+      }
     );
 
-    if (
-      previous &&
-      activeStatuses.includes(previous.status) &&
-      !replacingClaimedChain &&
-      Date.now() - Number(previous.createdAt || 0) <
-        12 * 60 * 60 * 1000
-    ) {
+    if (conflictingRoute) {
       return {
         ok: false,
-        error: '이전 GPT 자동회신 작업이 아직 진행 중입니다.'
+        error:
+          '이전 GPT 자동회신 작업이 아직 진행 중입니다.'
       };
     }
 
@@ -2674,7 +2828,9 @@ if (chrome.alarms && chrome.alarms.onAlarm) {
       alarm &&
       alarm.name === CTB_AUTO_RETURN_WATCH_ALARM
     ) {
-      ctbHandleReturnWatchAlarm().catch(function() {});
+      ctbQueueReturnMutation(function() {
+        return ctbHandleReturnWatchAlarm();
+      }).catch(function() {});
     }
   });
 }
@@ -2892,19 +3048,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'aiToTelegram') {
-    handleAiToTelegram(
-      aiTabId,
-      msg.autoSend,
-      {
-        sourceAiTabId: msg.sourceAiTabId,
-        sourceAiUrl: msg.sourceAiUrl,
-        sourceAiTitle: msg.sourceAiTitle
-      },
-      msg.autoReturn,
-      msg.copyTrigger,
-      false,
-      null
-    )
+    const performTransfer = function() {
+      return handleAiToTelegram(
+        aiTabId,
+        msg.autoSend,
+        {
+          sourceAiTabId: msg.sourceAiTabId,
+          sourceAiUrl: msg.sourceAiUrl,
+          sourceAiTitle: msg.sourceAiTitle
+        },
+        msg.autoReturn,
+        msg.copyTrigger,
+        false,
+        null
+      );
+    };
+
+    const transfer =
+      msg.autoReturn === true
+        ? ctbRunAutoReturnWhenJobSlotReady(
+            performTransfer
+          )
+        : performTransfer();
+
+    transfer
       .then(sendResponse)
       .catch(function(e) {
         sendResponse({
@@ -2914,6 +3081,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             String(e)
         });
       });
+
     return true;
   }
   if (msg.action === 'telegramToAI') {

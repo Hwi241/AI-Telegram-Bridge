@@ -6,7 +6,7 @@ window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__ = true;
 
 // content.js v5.0
 // Claude, ChatGPT, Gemini, Telegram 범용 지원
-const CTB_RUNTIME_BUILD = '062-46';
+const CTB_RUNTIME_BUILD = '063-22-test';
 
 console.log(
   '[CTB] content runtime ' +
@@ -3234,23 +3234,406 @@ function telegram_sortCachedMessages() {
  telegram_rebuildMessageIndex();
 }
 
-const ctbReportProbe = {
-  active: false,
-  chatKey: '',
-  jobId: '',
-  beginSequence: '',
-  beginSeen: false,
-  readySequence: '',
-  readySeen: false,
-  routeToken: '',
-  status: 'idle',
-  seen: new Map(),
-  candidates: [],
-  nextCandidateSequence: 1,
-  foreignJobSeen: false,
-  foreignReport: null,
-  foreignDuringOwnReport: false
+function ctbCreateReportProbe(routeToken = '') {
+  return {
+    active: false,
+    chatKey: '',
+    jobId: '',
+    jobConfirmed: false,
+    beginSequence: '',
+    beginSeen: false,
+    readySequence: '',
+    readySeen: false,
+    routeToken: routeToken,
+    status: 'idle',
+    seen: new Map(),
+    candidates: [],
+    nextCandidateSequence: 1,
+    foreignJobSeen: false,
+    foreignReport: null,
+    foreignDuringOwnReport: false
+  };
+}
+
+const ctbReportProbe = ctbCreateReportProbe();
+
+const ctbReportProbes = new Map();
+let ctbReportJobListWasMulti = false;
+
+function ctbRenderReportJobList() {
+  if (SITE !== 'telegram') return;
+
+  const container =
+    document.getElementById('ctb-report-job-list');
+
+  if (!container) return;
+
+  const activeProbes = Array.from(
+    ctbReportProbes.values()
+  )
+    .map(function(value) {
+      return value?.probe || value;
+    })
+    .filter(function(probe) {
+      return probe?.active === true;
+    });
+
+  if (activeProbes.length >= 2) {
+    ctbReportJobListWasMulti = true;
+  }
+
+  if (activeProbes.length === 0) {
+    ctbReportJobListWasMulti = false;
+  }
+
+  container.replaceChildren();
+
+  if (
+    !ctbReportJobListWasMulti ||
+    activeProbes.length === 0
+  ) {
+    container.style.display = 'none';
+    return;
+  }
+
+  const statusLabels = {
+    waiting_job: 'Job 등록 대기',
+    waiting_report: '결과 대기',
+    collecting_report: '완료보고 수집 중',
+    ready_detected: '완료보고 감지',
+    ambiguous: '확인 필요',
+    cancelled: '취소됨'
+  };
+
+  activeProbes.forEach(function(probe, index) {
+    const row = document.createElement('div');
+    row.className = 'ctb-report-job-row';
+
+    const jobLabel = probe.jobId ||
+      'Job 등록 대기 #' + (index + 1);
+
+    const statusLabel =
+      statusLabels[probe.status] ||
+      '진행 중';
+
+    row.textContent =
+      jobLabel + ' · ' + statusLabel;
+
+    container.appendChild(row);
+  });
+
+  container.style.display = 'block';
+}
+
+function ctbRegisterReportProbe(routeToken) {
+  if (
+    typeof routeToken !== 'string' ||
+    !routeToken
+  ) {
+    return null;
+  }
+
+  let removedInactiveProbe = false;
+
+  for (const [token, probe] of ctbReportProbes) {
+    if (!probe.active) {
+      ctbReportProbes.delete(token);
+      removedInactiveProbe = true;
+    }
+  }
+
+  if (removedInactiveProbe) {
+    ctbRenderReportJobList();
+  }
+
+  if (ctbReportProbes.has(routeToken)) {
+    return null;
+  }
+
+  const activeProbes =
+    Array.from(ctbReportProbes.values())
+      .filter(function(probe) {
+        return probe.active;
+      });
+
+  // 이전 작업의 Job 연결이 확인되기 전에는
+  // 다음 작업을 등록하지 않는다.
+  if (activeProbes.some(function(probe) {
+    return (
+      !probe.jobId ||
+      probe.jobConfirmed !== true
+    );
+  })) {
+    return null;
+  }
+
+  // 기존 단일 수집기는 계속 재사용하되,
+  // 이미 사용 중이면 독립 인스턴스를 생성한다.
+  const probe = activeProbes.includes(ctbReportProbe)
+    ? ctbCreateReportProbe(routeToken)
+    : ctbReportProbe;
+
+  ctbReportProbes.set(routeToken, probe);
+  ctbRenderReportJobList();
+  ctbReportProbeArm(routeToken, probe);
+
+  return probe;
+}
+
+const ctbReportDispatchState = {
+  ownerJobId: '',
+  blockedJobId: '',
+  knownJobIds: new Set()
 };
+
+function ctbReportDispatchFail(probes, reason) {
+  for (const probe of new Set(probes)) {
+    if (!probe?.active) continue;
+
+    ctbReportProbeStop(
+      'ambiguous',
+      reason,
+      'err',
+      probe
+    );
+  }
+
+  ctbReportDispatchState.ownerJobId = '';
+}
+
+function ctbObserveRegisteredReportProbes(descriptor) {
+  const active = Array.from(
+    new Set(ctbReportProbes.values())
+  ).filter(function(probe) {
+    return probe.active;
+  });
+
+  if (!active.length) {
+    ctbReportDispatchState.ownerJobId = '';
+    ctbReportDispatchState.blockedJobId = '';
+    return;
+  }
+
+  if (!descriptor?.key || !descriptor?.text) {
+    return;
+  }
+
+  const source = normalizeBridgeText(
+    descriptor.text
+  );
+
+  const jobLine = source
+    .split('\n')
+    .map(line => line.trim())
+    .find(line =>
+      /^Job:\s*J\d{4,}-\d{6}-\d{2}$/.test(line)
+    );
+
+  if (jobLine) {
+    const jobId = jobLine.replace(/^Job:\s*/, '');
+
+    const registered = Array.from(
+      new Set(ctbReportProbes.values())
+    ).find(probe => probe.jobId === jobId);
+
+    if (registered) {
+      if (registered.active) {
+        ctbReportProbeObserve(
+          descriptor,
+          registered
+        );
+      }
+      return;
+    }
+
+    if (
+      ctbReportDispatchState.knownJobIds.has(jobId)
+    ) {
+      return;
+    }
+
+    const pending = active.filter(probe =>
+      probe.active && !probe.jobId
+    );
+
+    if (pending.length !== 1) {
+      return;
+    }
+
+    ctbReportProbeObserve(
+      descriptor,
+      pending[0]
+    );
+
+    if (pending[0].jobId === jobId) {
+      const history =
+        ctbReportDispatchState.knownJobIds;
+
+      history.add(jobId);
+
+      if (history.size > 100) {
+        history.delete(
+          history.values().next().value
+        );
+      }
+    }
+
+    return;
+  }
+
+  // 단일 Job의 기존 검증·수집 방식은 유지한다.
+  if (
+    active.length === 1 &&
+    ctbReportProbes.size === 1 &&
+    ctbReportDispatchState.knownJobIds.size <= 1 &&
+    !ctbReportDispatchState.blockedJobId
+  ) {
+    ctbReportProbeObserve(
+      descriptor,
+      active[0]
+    );
+
+    if (!active[0].active) {
+      ctbReportDispatchState.ownerJobId = '';
+    }
+
+    return;
+  }
+
+  const parsed = ctbReportProbeParseMessage(
+    source
+  );
+
+  if (
+    parsed.beginSignals.length > 1 ||
+    parsed.readySignals.length > 1
+  ) {
+    ctbReportDispatchFail(
+      active,
+      '⚠️ 보고서 제어 신호 중복 · 수동전달 필요'
+    );
+    return;
+  }
+
+  const begin = parsed.beginSignals[0] || null;
+  const ready = parsed.readySignals[0] || null;
+
+  // 다른 미등록 Job의 보고서가 끝날 때까지
+  // 본문을 어떤 수집기에도 전달하지 않는다.
+  if (ctbReportDispatchState.blockedJobId) {
+    if (
+      ready?.jobId ===
+      ctbReportDispatchState.blockedJobId
+    ) {
+      ctbReportDispatchState.blockedJobId = '';
+    }
+    return;
+  }
+
+  const collecting = active.filter(probe =>
+    probe.beginSeen && !probe.readySeen
+  );
+
+  if (collecting.length > 1) {
+    ctbReportDispatchFail(
+      collecting,
+      '⚠️ 보고서 소유 작업 중복 · 수동전달 필요'
+    );
+    return;
+  }
+
+  const owner = active.find(probe =>
+    probe.jobId ===
+    ctbReportDispatchState.ownerJobId
+  ) || collecting[0] || null;
+
+  if (begin) {
+    const target = active.find(probe =>
+      probe.jobId === begin.jobId
+    );
+
+    if (
+      ready &&
+      ready.jobId !== begin.jobId
+    ) {
+      ctbReportDispatchFail(
+        [owner, target],
+        '⚠️ BEGIN/READY Job 불일치'
+      );
+      return;
+    }
+
+    if (!target || (owner && owner !== target)) {
+      ctbReportDispatchFail(
+        [owner, target],
+        '⚠️ 서로 다른 Job 보고서 중첩'
+      );
+
+      if (!ready) {
+        ctbReportDispatchState.blockedJobId =
+          begin.jobId;
+      }
+
+      return;
+    }
+
+    ctbReportDispatchState.ownerJobId =
+      target.jobId;
+
+    ctbReportProbeObserve(
+      descriptor,
+      target
+    );
+
+    if (ready || !target.active) {
+      ctbReportDispatchState.ownerJobId = '';
+    }
+
+    return;
+  }
+
+  if (ready) {
+    const target = active.find(probe =>
+      probe.jobId === ready.jobId
+    );
+
+    if (!owner || owner !== target) {
+      ctbReportDispatchFail(
+        [owner, target],
+        '⚠️ 완료보고 소유 Job 불일치'
+      );
+      return;
+    }
+
+    ctbReportProbeObserve(
+      descriptor,
+      owner
+    );
+
+    ctbReportDispatchState.ownerJobId = '';
+    return;
+  }
+
+  // 여러 작업이 대기 중일 때는
+  // BEGIN으로 확인된 Job에만 본문을 전달한다.
+  if (owner) {
+    ctbReportProbeObserve(
+      descriptor,
+      owner
+    );
+  }
+}
+
+function ctbSyncRegisteredCancelledRoutes(routes) {
+  for (const probe of ctbReportProbes.values()) {
+    if (probe.routeToken) {
+      ctbSyncCancelledAutoReturnRoute(
+        routes,
+        probe
+      );
+    }
+  }
+}
 
 const CTB_REPORT_PROBE_MAX_CANDIDATES = 200;
 const CTB_REPORT_PROBE_MAX_TEXT_LENGTH = 250000;
@@ -3310,9 +3693,9 @@ function ctbReportProbeParseMessage(text) {
 
 function ctbReportProbeClassifyJobSignals(
   beginSignal,
-  readySignal
+  readySignal,
+  probe = ctbReportProbe
 ) {
-  const probe = ctbReportProbe;
   const ownJobId = probe.jobId;
 
   const ownBegin = !!(
@@ -3422,10 +3805,14 @@ function ctbReportProbeClassifyJobSignals(
   return 'own';
 }
 
-function ctbReportProbeAddCandidate(descriptor, text) {
+function ctbReportProbeAddCandidate(
+  descriptor,
+  text,
+  probe = ctbReportProbe
+) {
   if (!text || !text.trim()) return true;
 
-  const existing = ctbReportProbe.candidates.find(
+  const existing = probe.candidates.find(
     function(item) {
       return item.key === descriptor.key;
     }
@@ -3437,21 +3824,23 @@ function ctbReportProbeAddCandidate(descriptor, text) {
     return true;
   }
 
-  ctbReportProbe.candidates.push({
+  probe.candidates.push({
     key: descriptor.key,
     order: descriptor.order,
-    sequence: ctbReportProbe.nextCandidateSequence++,
+    sequence: probe.nextCandidateSequence++,
     text: text
   });
 
   return (
-    ctbReportProbe.candidates.length <=
+    probe.candidates.length <=
     CTB_REPORT_PROBE_MAX_CANDIDATES
   );
 }
 
-function ctbReportProbeBuildResult() {
-  const candidates = ctbReportProbe.candidates.slice();
+function ctbReportProbeBuildResult(
+  probe = ctbReportProbe
+) {
+  const candidates = probe.candidates.slice();
 
   if (!candidates.length) {
     return {
@@ -3512,7 +3901,11 @@ function ctbReportProbeBuildResult() {
   };
 }
 
-function ctbReportProbeShow(message, type) {
+function ctbReportProbeShow(
+  message,
+  type,
+  probe = ctbReportProbe
+) {
   const panel = document.getElementById('ctb-tg-panel');
   const statusEl = panel?.querySelector('#ctb-status');
 
@@ -3520,40 +3913,50 @@ function ctbReportProbeShow(message, type) {
     setPanelStatus(statusEl, message, type || '');
   }
 
+  ctbRenderReportJobList();
+
   const copyButton = panel?.querySelector(
     '#ctb-report-probe-copy'
   );
 
   if (copyButton) {
     const canCopy =
-      ctbReportProbe.status === 'ready_detected' &&
-      ctbReportProbe.candidates.length > 0;
+      probe.status === 'ready_detected' &&
+      probe.candidates.length > 0;
 
     copyButton.style.display =
       canCopy ? 'block' : 'none';
   }
 }
 
-function ctbReportProbeStop(status, message, type) {
-  ctbReportProbe.active = false;
-  ctbReportProbe.status = status;
+function ctbReportProbeStop(
+  status,
+  message,
+  type,
+  probe = ctbReportProbe
+) {
+  probe.active = false;
+  probe.status = status;
 
-  ctbReportProbeShow(message, type);
+  ctbReportProbeShow(message, type, probe);
 
   console.info('[CTB REPORT PROBE]', {
     status: status,
-    jobId: ctbReportProbe.jobId,
-    beginSeen: ctbReportProbe.beginSeen,
-    beginSequence: ctbReportProbe.beginSequence,
-    readySequence: ctbReportProbe.readySequence,
-    candidateCount: ctbReportProbe.candidates.length
+    jobId: probe.jobId,
+    beginSeen: probe.beginSeen,
+    beginSequence: probe.beginSequence,
+    readySequence: probe.readySequence,
+    candidateCount: probe.candidates.length
   });
 }
 
-function ctbSyncCancelledAutoReturnRoute(routes) {
+function ctbSyncCancelledAutoReturnRoute(
+  routes,
+  probe = ctbReportProbe
+) {
   if (
     SITE !== 'telegram' ||
-    !ctbReportProbe.routeToken ||
+    !probe.routeToken ||
     !Array.isArray(routes)
   ) {
     return;
@@ -3563,7 +3966,7 @@ function ctbSyncCancelledAutoReturnRoute(routes) {
     return (
       item?.routingVersion === '061-8' &&
       item?.autoReturn === true &&
-      item?.token === ctbReportProbe.routeToken
+      item?.token === probe.routeToken
     );
   });
 
@@ -3575,8 +3978,8 @@ function ctbSyncCancelledAutoReturnRoute(routes) {
   }
 
   if (
-    !ctbReportProbe.active &&
-    ctbReportProbe.status !== 'ready_detected'
+    !probe.active &&
+    probe.status !== 'ready_detected'
   ) {
     return;
   }
@@ -3584,86 +3987,98 @@ function ctbSyncCancelledAutoReturnRoute(routes) {
   ctbReportProbeStop(
     'cancelled',
     '⛔ GPT 자동전달 취소됨',
-    'err'
+    'err',
+    probe
   );
 
-  ctbReportProbe.routeToken = '';
-  ctbReportProbe.jobId = '';
-  ctbReportProbe.beginSequence = '';
-  ctbReportProbe.beginSeen = false;
-  ctbReportProbe.readySequence = '';
-  ctbReportProbe.readySeen = false;
-  ctbReportProbe.candidates = [];
-  ctbReportProbe.nextCandidateSequence = 1;
-  ctbReportProbe.seen = new Map();
-  ctbReportProbe.foreignJobSeen = false;
-  ctbReportProbe.foreignReport = null;
-  ctbReportProbe.foreignDuringOwnReport = false;
+  probe.routeToken = '';
+  probe.jobId = '';
+  probe.beginSequence = '';
+  probe.beginSeen = false;
+  probe.readySequence = '';
+  probe.readySeen = false;
+  probe.candidates = [];
+  probe.nextCandidateSequence = 1;
+  probe.seen = new Map();
+  probe.foreignJobSeen = false;
+  probe.foreignReport = null;
+  probe.foreignDuringOwnReport = false;
 }
 
-function ctbReportProbeArm(routeToken) {
+function ctbReportProbeArm(
+  routeToken,
+  probe = ctbReportProbe
+) {
   if (SITE !== 'telegram') return;
 
-  ctbReportProbe.active = false;
+  probe.active = false;
 
   telegram_ensureAnswerBatchObserver();
   telegram_captureAnswerBatch();
 
-  ctbReportProbe.chatKey = telegram_getCurrentChatKey();
-  ctbReportProbe.jobId = '';
-  ctbReportProbe.beginSequence = '';
-  ctbReportProbe.beginSeen = false;
-  ctbReportProbe.readySequence = '';
-  ctbReportProbe.readySeen = false;
-  ctbReportProbe.routeToken =
+  probe.chatKey = telegram_getCurrentChatKey();
+  probe.jobId = '';
+  probe.jobConfirmed = false;
+  probe.beginSequence = '';
+  probe.beginSeen = false;
+  probe.readySequence = '';
+  probe.readySeen = false;
+  probe.routeToken =
     typeof routeToken === 'string' ? routeToken : '';
-  ctbReportProbe.status = 'waiting_job';
-  ctbReportProbe.candidates = [];
-  ctbReportProbe.nextCandidateSequence = 1;
-  ctbReportProbe.seen = new Map();
-  ctbReportProbe.foreignJobSeen = false;
-  ctbReportProbe.foreignReport = null;
-  ctbReportProbe.foreignDuringOwnReport = false;
+  probe.status = 'waiting_job';
+  probe.candidates = [];
+  probe.nextCandidateSequence = 1;
+  probe.seen = new Map();
+  probe.foreignJobSeen = false;
+  probe.foreignReport = null;
+  probe.foreignDuringOwnReport = false;
 
   telegramAnswerBatchCache.messages.forEach(function(message) {
-    ctbReportProbe.seen.set(message.key, message.text);
+    probe.seen.set(message.key, message.text);
   });
 
-  ctbReportProbe.active = true;
+  probe.active = true;
 
-  ctbReportProbeShow('⏳ Job 등록 감지 대기');
+  ctbReportProbeShow('⏳ Job 등록 감지 대기', '', probe);
 
   console.info('[CTB REPORT PROBE]', {
     status: 'waiting_job',
     chatKeyMatched: true
   });
 
-  if (ctbReportProbe.routeToken) {
+  if (probe.routeToken) {
     chrome.storage.local.get(
       ['bridge_auto_return_routes'],
       function(result) {
         ctbSyncCancelledAutoReturnRoute(
-          result?.bridge_auto_return_routes
+          result?.bridge_auto_return_routes,
+          probe
         );
       }
     );
   }
 }
 
-function ctbReportProbeCancel() {
-  if (!ctbReportProbe.active) return;
+function ctbReportProbeCancel(
+  probe = ctbReportProbe
+) {
+  if (!probe.active) return;
 
   ctbReportProbeStop(
     'cancelled',
     '⚠️ 감지 예약 취소',
-    'err'
+    'err',
+    probe
   );
 }
 
-function ctbReportProbeObserve(descriptor) {
+function ctbReportProbeObserve(
+  descriptor,
+  probe = ctbReportProbe
+) {
   if (
     SITE !== 'telegram' ||
-    !ctbReportProbe.active ||
+    !probe.active ||
     !descriptor?.key ||
     !descriptor?.text
   ) {
@@ -3671,25 +4086,26 @@ function ctbReportProbeObserve(descriptor) {
   }
 
   if (
-    ctbReportProbe.chatKey !==
+    probe.chatKey !==
     telegram_getCurrentChatKey()
   ) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ Telegram 채팅이 변경됨',
-      'err'
+      'err',
+      probe
     );
     return;
   }
 
   if (
-    ctbReportProbe.seen.get(descriptor.key) ===
+    probe.seen.get(descriptor.key) ===
     descriptor.text
   ) {
     return;
   }
 
-  ctbReportProbe.seen.set(
+  probe.seen.set(
     descriptor.key,
     descriptor.text
   );
@@ -3709,53 +4125,71 @@ function ctbReportProbeObserve(descriptor) {
     const nextJobId = jobLine.replace(/^Job:\s*/, '');
 
     if (
-      ctbReportProbe.jobId &&
-      ctbReportProbe.jobId !== nextJobId
+      probe.jobId &&
+      probe.jobId !== nextJobId
     ) {
-      ctbReportProbe.foreignJobSeen = true;
+      probe.foreignJobSeen = true;
 
-      if (ctbReportProbe.beginSeen) {
-        ctbReportProbe.foreignDuringOwnReport = true;
+      if (probe.beginSeen) {
+        probe.foreignDuringOwnReport = true;
       }
 
       return;
     }
 
-    if (!ctbReportProbe.jobId) {
-      ctbReportProbe.jobId = nextJobId;
+    if (!probe.jobId) {
+      probe.jobId = nextJobId;
 
-      if (ctbReportProbe.routeToken) {
+      if (probe.routeToken) {
         const requestedRouteToken =
-          ctbReportProbe.routeToken;
+          probe.routeToken;
 
         chrome.runtime.sendMessage({
           action: 'ctbAutoReturnJob',
           token: requestedRouteToken,
           jobId: nextJobId
-        }, function() {
-          void chrome.runtime.lastError;
+        }, function(result) {
+          const runtimeError = chrome.runtime.lastError;
 
           if (
-            ctbReportProbe.status === 'cancelled' ||
-            ctbReportProbe.routeToken !==
-              requestedRouteToken
+            probe.status === 'cancelled' ||
+            probe.routeToken !==
+              requestedRouteToken ||
+            probe.jobId !== nextJobId
           ) {
             return;
           }
+
+          if (
+            runtimeError ||
+            result?.ok !== true
+          ) {
+            ctbReportProbeStop(
+              'ambiguous',
+              '⚠️ Job 등록 확인 실패 · 수동전달 필요',
+              'err',
+              probe
+            );
+            return;
+          }
+
+          probe.jobConfirmed = true;
         });
       }
 
-      ctbReportProbe.status = 'waiting_report';
+      probe.status = 'waiting_report';
 
       ctbReportProbeShow(
-        '⏳ ' + nextJobId + ' 결과 대기'
+        '⏳ ' + nextJobId + ' 결과 대기',
+        '',
+        probe
       );
     }
 
     return;
   }
 
-  if (!ctbReportProbe.jobId) return;
+  if (!probe.jobId) return;
 
   const parsed = ctbReportProbeParseMessage(normalizedText);
 
@@ -3766,7 +4200,8 @@ function ctbReportProbeObserve(descriptor) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ 보고서 제어 신호 중복',
-      'err'
+      'err',
+      probe
     );
     return;
   }
@@ -3777,7 +4212,8 @@ function ctbReportProbeObserve(descriptor) {
   const jobDisposition =
     ctbReportProbeClassifyJobSignals(
       beginSignal,
-      readySignal
+      readySignal,
+      probe
     );
 
   if (jobDisposition === 'ignore') {
@@ -3788,43 +4224,48 @@ function ctbReportProbeObserve(descriptor) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ Job 보고 구간 중첩 · 수동전달 필요',
-      'err'
+      'err',
+      probe
     );
 
     return;
   }
 
   if (beginSignal) {
-    if (beginSignal.jobId !== ctbReportProbe.jobId) {
+    if (beginSignal.jobId !== probe.jobId) {
       ctbReportProbeStop(
         'ambiguous',
         '⚠️ 보고 시작 Job ID 불일치',
-        'err'
+        'err',
+        probe
       );
       return;
     }
 
     if (
-      ctbReportProbe.beginSeen &&
-      ctbReportProbe.beginSequence !== beginSignal.sequence
+      probe.beginSeen &&
+      probe.beginSequence !== beginSignal.sequence
     ) {
       ctbReportProbeStop(
         'ambiguous',
         '⚠️ 보고 시작 R번호 불일치',
-        'err'
+        'err',
+        probe
       );
       return;
     }
 
-    if (!ctbReportProbe.beginSeen) {
-      ctbReportProbe.beginSeen = true;
-      ctbReportProbe.beginSequence = beginSignal.sequence;
-      ctbReportProbe.candidates = [];
-      ctbReportProbe.nextCandidateSequence = 1;
-      ctbReportProbe.status = 'collecting_report';
+    if (!probe.beginSeen) {
+      probe.beginSeen = true;
+      probe.beginSequence = beginSignal.sequence;
+      probe.candidates = [];
+      probe.nextCandidateSequence = 1;
+      probe.status = 'collecting_report';
       ctbReportProbeShow(
-        '⏳ ' + ctbReportProbe.jobId + ' ' +
-          beginSignal.sequence + ' 완료보고 수집 중'
+        '⏳ ' + probe.jobId + ' ' +
+          beginSignal.sequence + ' 완료보고 수집 중',
+        '',
+        probe
       );
     }
   }
@@ -3832,66 +4273,71 @@ function ctbReportProbeObserve(descriptor) {
   if (
     !ctbReportProbeAddCandidate(
       descriptor,
-      parsed.body
+      parsed.body,
+      probe
     )
   ) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ 수집 상한 초과 · 확인 필요',
-      'err'
+      'err',
+      probe
     );
     return;
   }
 
   if (!readySignal) return;
 
-  if (readySignal.jobId !== ctbReportProbe.jobId) {
+  if (readySignal.jobId !== probe.jobId) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ 종료 신호 Job ID 불일치',
-      'err'
+      'err',
+      probe
     );
     return;
   }
 
   if (
-    ctbReportProbe.beginSeen &&
-    ctbReportProbe.beginSequence !== readySignal.sequence
+    probe.beginSeen &&
+    probe.beginSequence !== readySignal.sequence
   ) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ BEGIN/READY R번호 불일치',
-      'err'
+      'err',
+      probe
     );
     return;
   }
 
   if (
     readySignal &&
-    readySignal.jobId === ctbReportProbe.jobId &&
-    ctbReportProbe.foreignDuringOwnReport
+    readySignal.jobId === probe.jobId &&
+    probe.foreignDuringOwnReport
   ) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ 보고 도중 다른 Job 활동 · 수동전달 필요',
-      'err'
+      'err',
+      probe
     );
 
     return;
   }
 
-  ctbReportProbe.readySequence = readySignal.sequence;
-  ctbReportProbe.readySeen = true;
+  probe.readySequence = readySignal.sequence;
+  probe.readySeen = true;
 
-  const result = ctbReportProbeBuildResult();
+  const result = ctbReportProbeBuildResult(probe);
 
   const legacyValid =
-    !ctbReportProbe.beginSeen &&
-    !ctbReportProbe.foreignJobSeen &&
+    !probe.beginSeen &&
+    !probe.foreignJobSeen &&
     result.candidateCount === 1;
 
   const boundedValid =
-    ctbReportProbe.beginSeen &&
+    probe.beginSeen &&
     result.candidateCount >= 1 &&
     result.candidateCount <= CTB_REPORT_PROBE_MAX_CANDIDATES;
 
@@ -3899,7 +4345,8 @@ function ctbReportProbeObserve(descriptor) {
     ctbReportProbeStop(
       'ambiguous',
       '⚠️ 완료보고 결합 실패 · 수동전달 필요',
-      'err'
+      'err',
+      probe
     );
     return;
   }
@@ -3908,26 +4355,27 @@ function ctbReportProbeObserve(descriptor) {
     'ready_detected',
     '✅ ' + readySignal.jobId + ' ' + readySignal.sequence +
       ' 감지 · 후보 ' + result.candidateCount + '개',
-    'ok'
+    'ok',
+    probe
   );
 
-  if (ctbReportProbe.routeToken) {
+  if (probe.routeToken) {
     const requestedRouteToken =
-      ctbReportProbe.routeToken;
+      probe.routeToken;
 
     chrome.runtime.sendMessage(
       {
         action: 'ctbAutoReturnReady',
         token: requestedRouteToken,
-        jobId: ctbReportProbe.jobId,
-        beginSeen: ctbReportProbe.beginSeen,
+        jobId: probe.jobId,
+        beginSeen: probe.beginSeen,
         beginJobId:
-          ctbReportProbe.beginSeen
-            ? ctbReportProbe.jobId
+          probe.beginSeen
+            ? probe.jobId
             : '',
-        beginSequence: ctbReportProbe.beginSequence,
+        beginSequence: probe.beginSequence,
         readyJobId: readySignal.jobId,
-        sequence: ctbReportProbe.readySequence,
+        sequence: probe.readySequence,
         candidateCount: result.candidateCount,
         text: result.text
       },
@@ -3935,8 +4383,8 @@ function ctbReportProbeObserve(descriptor) {
         const runtimeError = chrome.runtime.lastError;
 
         if (
-          ctbReportProbe.status === 'cancelled' ||
-          ctbReportProbe.routeToken !==
+          probe.status === 'cancelled' ||
+          probe.routeToken !==
             requestedRouteToken
         ) {
           return;
@@ -3945,14 +4393,16 @@ function ctbReportProbeObserve(descriptor) {
         if (runtimeError || !deliveryResult?.ok) {
           ctbReportProbeShow(
             '⚠️ GPT 자동전송 미확인 · 수동전달 가능',
-            'err'
+            'err',
+            probe
           );
           return;
         }
 
         ctbReportProbeShow(
           '✅ GPT 전송 버튼 클릭 완료',
-          'ok'
+          'ok',
+          probe
         );
       }
     );
@@ -3997,7 +4447,7 @@ function telegram_storeCachedMessage(
  descriptor
  );
 
- ctbReportProbeObserve(descriptor);
+ ctbObserveRegisteredReportProbes(descriptor);
 
  return;
  }
@@ -4022,7 +4472,7 @@ function telegram_storeCachedMessage(
  descriptor
  );
 
- ctbReportProbeObserve(descriptor);
+ ctbObserveRegisteredReportProbes(descriptor);
 }
 
 const telegramRouteIncomingKeys =
@@ -7128,9 +7578,28 @@ const PANEL_STYLES = `
     #ctb-status.ok  { color: #4ade80; }
     #ctb-status.err { color: #f87171; }
     .ctb-runtime-build {
-      position: absolute; right: 4px; bottom: 1px;
-      font-size: 7px; line-height: 1; color: #555577;
+      display: block;
+      position: static;
+      margin-top: 3px;
+      font-size: 9px;
+      line-height: 1.2;
+      color: #cbd5e1;
+      text-align: right;
+      white-space: nowrap;
       pointer-events: none;
+    }
+    #ctb-report-job-list {
+      margin-top: 5px;
+      max-height: 150px;
+      overflow-y: auto;
+      font-size: 9px;
+    }
+    .ctb-report-job-row {
+      padding: 4px 3px;
+      border-top: 1px solid #333355;
+      color: #cbd5e1;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
     }
     #ctb-token-counter {
       position: absolute; font-size: 10px; color: #888;
@@ -7904,7 +8373,7 @@ function injectAIWidget() {
       <button id="ctb-ai-switch" class="ctb-switch-btn">🔁 위젯 전환</button>
       <div id="ctb-status"></div>
     </div>
-    <span class="ctb-runtime-build">${CTB_RUNTIME_BUILD}</span>
+    <span class="ctb-runtime-build">확장 ${CTB_RUNTIME_BUILD}</span>
   `;
 
   document.body.appendChild(panel);
@@ -8197,11 +8666,15 @@ function injectAIWidget() {
                       : 'code'
                   );
 
-                  autoCheck.checked =
-                    settings?.bridge_autosend_ai !== false;
+                  if (SITE === 'chatgpt') {
+                    ctbLoadGptTabSettings();
+                  } else {
+                    autoCheck.checked =
+                      settings?.bridge_autosend_ai !== false;
 
-                  autoReturnCheck.checked =
-                    settings?.bridge_auto_return_enabled === true;
+                    autoReturnCheck.checked =
+                      settings?.bridge_auto_return_enabled === true;
+                  }
 
                   refreshDeepSeekBalanceBox();
                   applyDeepSeekPeakStyle();
@@ -8883,26 +9356,160 @@ function injectAIWidget() {
     _prevStreaming = null;
     checkStreaming();
   });
-  chrome.storage.local.get(['bridge_autosend_ai'], (res) => {
-    if (res?.bridge_autosend_ai !== undefined) autoCheck.checked = res.bridge_autosend_ai;
-  });
+  if (SITE !== 'chatgpt') {
+    chrome.storage.local.get(
+      ['bridge_autosend_ai'],
+      (res) => {
+        if (res?.bridge_autosend_ai !== undefined) {
+          autoCheck.checked = res.bridge_autosend_ai;
+        }
+      }
+    );
+  }
   autoCheck.addEventListener('change', () => {
-    chrome.storage.local.set({ bridge_autosend_ai: autoCheck.checked });
+    if (SITE === 'chatgpt') {
+      ctbSaveGptTabSettings();
+      return;
+    }
+
+    chrome.storage.local.set({
+      bridge_autosend_ai: autoCheck.checked
+    });
   });
-  chrome.storage.local.get(['bridge_auto_return_enabled'], (res) => {
-    autoReturnCheck.checked =
-      res?.bridge_auto_return_enabled === true;
-  });
+  if (SITE !== 'chatgpt') {
+    chrome.storage.local.get(
+      ['bridge_auto_return_enabled'],
+      (res) => {
+        autoReturnCheck.checked =
+          res?.bridge_auto_return_enabled === true;
+      }
+    );
+  }
   autoReturnCheck.addEventListener('change', () => {
+    if (SITE === 'chatgpt') {
+      ctbSaveGptTabSettings();
+      return;
+    }
+
     chrome.storage.local.set({
       bridge_auto_return_enabled:
         autoReturnCheck.checked
     });
   });
+  if (SITE === 'chatgpt') {
+    autoCheck.disabled = true;
+    autoReturnCheck.disabled = true;
+  }
   const setStatus = (msg, type) => setPanelStatus(statusEl, msg, type);
   const setBtnsDisabled = (v) => setPanelBtnsDisabled([btn1], v);
   let currentAutoReturnRoute = null;
   let autoReturnCancelStateRequest = 0;
+  let ctbPanelSenderTabId = 0;
+  const CTB_GPT_TAB_SETTINGS_PREFIX =
+    'bridge_gpt_tab_settings_';
+
+  let ctbGptTabSettingsReady = SITE !== 'chatgpt';
+  let ctbGptTabSettingsLoadRequest = 0;
+
+  function ctbLoadGptTabSettings() {
+    if (
+      SITE !== 'chatgpt' ||
+      ctbPanelSenderTabId <= 0
+    ) {
+      return;
+    }
+
+    const tabId = ctbPanelSenderTabId;
+    const requestId = ++ctbGptTabSettingsLoadRequest;
+    const key = CTB_GPT_TAB_SETTINGS_PREFIX + tabId;
+
+    chrome.storage.local.get(
+      [
+        key,
+        'bridge_autosend_ai',
+        'bridge_auto_return_enabled'
+      ],
+      function(result) {
+        if (
+          chrome.runtime.lastError ||
+          requestId !== ctbGptTabSettingsLoadRequest ||
+          tabId !== ctbPanelSenderTabId
+        ) {
+          return;
+        }
+
+        const saved = result?.[key];
+
+        autoCheck.checked =
+          typeof saved?.autoSend === 'boolean'
+            ? saved.autoSend
+            : result?.bridge_autosend_ai !== false;
+
+        autoReturnCheck.checked =
+          typeof saved?.autoReturn === 'boolean'
+            ? saved.autoReturn
+            : result?.bridge_auto_return_enabled === true;
+
+        ctbGptTabSettingsReady = true;
+        autoCheck.disabled = false;
+        autoReturnCheck.disabled = false;
+      }
+    );
+  }
+
+  function ctbSaveGptTabSettings() {
+    if (
+      SITE !== 'chatgpt' ||
+      !ctbGptTabSettingsReady ||
+      ctbPanelSenderTabId <= 0
+    ) {
+      return;
+    }
+
+    ++ctbGptTabSettingsLoadRequest;
+
+    const key =
+      CTB_GPT_TAB_SETTINGS_PREFIX +
+      ctbPanelSenderTabId;
+
+    chrome.storage.local.set({
+      [key]: {
+        autoSend: autoCheck.checked,
+        autoReturn: autoReturnCheck.checked
+      }
+    });
+  }
+
+  function ctbResolvePanelSenderTabId() {
+    if (SITE !== 'chatgpt') return;
+
+    chrome.runtime.sendMessage(
+      { action: 'getAiTabs' },
+      function(result) {
+        const runtimeError = chrome.runtime.lastError;
+
+        if (runtimeError) return;
+
+        const tabId = Number(
+          result?.senderTabId || 0
+        );
+
+        if (
+          !Number.isInteger(tabId) ||
+          tabId <= 0
+        ) {
+          return;
+        }
+
+        if (ctbPanelSenderTabId !== tabId) {
+          ctbPanelSenderTabId = tabId;
+          ctbGptTabSettingsReady = false;
+          ctbLoadGptTabSettings();
+          refreshAutoReturnRouteStatus();
+        }
+      }
+    );
+  }
 
   function refreshAutoReturnCancelState() {
     const requestId =
@@ -8957,11 +9564,21 @@ function injectAIWidget() {
       return;
     }
 
+    const currentConversationUrl =
+      normalizeAutoReturnConversationUrl(
+        location.href
+      );
+
     const route = routes
       .filter(function(item) {
         return (
-          item.routingVersion === '061-8' &&
-          item.autoReturn === true
+          item?.routingVersion === '061-8' &&
+          item?.autoReturn === true &&
+          ctbPanelSenderTabId > 0 &&
+          item?.sourceTabId ===
+            ctbPanelSenderTabId &&
+          item?.sourceConversationUrl ===
+            currentConversationUrl
         );
       })
       .sort(function(a, b) {
@@ -9072,7 +9689,7 @@ function injectAIWidget() {
         areaName === 'local' &&
         changes?.bridge_auto_return_routes
       ) {
-        ctbSyncCancelledAutoReturnRoute(
+        ctbSyncRegisteredCancelledRoutes(
           changes.bridge_auto_return_routes.newValue
         );
 
@@ -9123,6 +9740,7 @@ function injectAIWidget() {
   );
 
   refreshAutoReturnRouteStatus();
+  ctbResolvePanelSenderTabId();
 
   let telegramSendQueued = false;
   let telegramSendQueueSending = false;
@@ -9767,8 +10385,9 @@ function injectTGWidget() {
       </label>
       <button id="ctb-tg-switch" class="ctb-switch-btn">🔁 위젯 전환</button>
       <div id="ctb-status"></div>
+      <div id="ctb-report-job-list" style="display:none"></div>
     </div>
-    <span class="ctb-runtime-build">${CTB_RUNTIME_BUILD}</span>
+    <span class="ctb-runtime-build">확장 ${CTB_RUNTIME_BUILD}</span>
   `;
 
   document.body.appendChild(panel);
@@ -10535,11 +11154,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.action === 'ctbAutoReturnWatch') {
+    const probe = ctbReportProbes.get(msg.token);
+
     if (
       SITE !== 'telegram' ||
-      !ctbReportProbe.active ||
-      !ctbReportProbe.routeToken ||
-      msg.token !== ctbReportProbe.routeToken
+      !probe?.active ||
+      !probe?.routeToken ||
+      msg.token !== probe.routeToken
     ) {
       sendResponse({
         ok: false,
@@ -10555,9 +11176,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     sendResponse({
       ok: true,
-      status: ctbReportProbe.status,
-      jobId: ctbReportProbe.jobId,
-      candidateCount: ctbReportProbe.candidates.length,
+      status: probe.status,
+      jobId: probe.jobId,
+      candidateCount: probe.candidates.length,
       documentHidden: document.hidden === true,
       visibilityState: document.visibilityState || ''
     });
@@ -10698,10 +11319,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.action === 'sendToTelegram') {
+    const hasActiveReportProbe =
+      Array.from(ctbReportProbes.values()).some(
+        function(probe) {
+          return probe.active;
+        }
+      );
+
     if (
-      ctbReportProbe.active &&
-      ctbReportProbe.routeToken &&
-      msg.autoSend === true
+      SITE === 'telegram' &&
+      msg.autoSend === true &&
+      !msg.ctbReturnToken &&
+      hasActiveReportProbe
     ) {
       sendResponse({
         ok: false,
@@ -10717,7 +11346,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       !!msg.ctbReturnToken;
 
     if (probeRequested) {
-      ctbReportProbeArm(msg.ctbReturnToken || '');
+      const registeredProbe = ctbRegisterReportProbe(
+        msg.ctbReturnToken
+      );
+
+      if (!registeredProbe) {
+        sendResponse({
+          ok: false,
+          error: '이전 자동회신 Job이 진행 중입니다.'
+        });
+        return true;
+      }
     }
 
     telegram_sendWholeTextOnce(
@@ -10725,13 +11364,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       msg.autoSend
     ).then(function(result) {
       if (!result?.ok && probeRequested) {
-        ctbReportProbeCancel();
+        ctbReportProbeCancel(
+          ctbReportProbes.get(msg.ctbReturnToken) ||
+            ctbReportProbe
+        );
+        ctbReportProbes.delete(msg.ctbReturnToken);
+        ctbRenderReportJobList();
       }
 
       sendResponse(result);
     }).catch(function(error) {
       if (probeRequested) {
-        ctbReportProbeCancel();
+        ctbReportProbeCancel(
+          ctbReportProbes.get(msg.ctbReturnToken) ||
+            ctbReportProbe
+        );
+        ctbReportProbes.delete(msg.ctbReturnToken);
+        ctbRenderReportJobList();
       }
 
       sendResponse({
