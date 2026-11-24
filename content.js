@@ -6,7 +6,7 @@ window.__AI_TELEGRAM_BRIDGE_CONTENT_LOADED__ = true;
 
 // content.js v5.0
 // Claude, ChatGPT, Gemini, Telegram 범용 지원
-const CTB_RUNTIME_BUILD = '063-22-test';
+const CTB_RUNTIME_BUILD = '063-26-test';
 
 console.log(
   '[CTB] content runtime ' +
@@ -2425,20 +2425,25 @@ function chatgpt_waitForReadyAndSend(
  getContentEditablePlainText(latestInput)
  );
 
- if (
+ const newAttachmentDetected =
  latestAttachmentState.count >
- initialAttachmentCount
- ) {
+ initialAttachmentCount;
+
+ if (newAttachmentDetected) {
+ // 긴 붙여넣기가 파일로 변환된 경우
+ // 기존 자동회신 경로에서 생성된 신규 첨부만 인정한다.
+ // 첨부와 입력 텍스트가 함께 있으면 중단한다.
+ if (latestText !== '') {
  finish({
  ok: false,
  sent: false,
  phase: 'gpt_input_failed',
- error: '자동회신 원문 완전성을 확인할 수 없음'
+ error: '자동회신 첨부파일과 입력 텍스트가 동시에 존재함'
  });
  return;
  }
-
- if (latestText !== expectedText) {
+ } else if (latestText !== expectedText) {
+ // 일반 텍스트는 기존 원문 일치 검증 유지
  finish({
  ok: false,
  sent: false,
@@ -3563,6 +3568,15 @@ function ctbObserveRegisteredReportProbes(descriptor) {
       return;
     }
 
+    if (!target && !owner) {
+      if (!ready) {
+        ctbReportDispatchState.blockedJobId =
+          begin.jobId;
+      }
+
+      return;
+    }
+
     if (!target || (owner && owner !== target)) {
       ctbReportDispatchFail(
         [owner, target],
@@ -4433,6 +4447,9 @@ function telegram_storeCachedMessage(
  telegramAnswerBatchCache
  .messages[existingIndex];
 
+ const textChanged =
+ existing.text !== descriptor.text;
+
  existing.text = descriptor.text;
 
  if (
@@ -4447,7 +4464,9 @@ function telegram_storeCachedMessage(
  descriptor
  );
 
+ if (textChanged) {
  ctbObserveRegisteredReportProbes(descriptor);
+ }
 
  return;
  }
